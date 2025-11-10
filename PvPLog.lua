@@ -217,18 +217,48 @@ local function OnLeaveArena()
     currentMatch = nil
 end
 
--- Event handling: monitor instance type transitions
+local addonInitialized = false
+
+local function EnsureInitialized()
+    if addonInitialized then
+        return
+    end
+    InitDB()
+    addonInitialized = true
+end
+
+PvPLog:RegisterEvent("ADDON_LOADED")
+PvPLog:RegisterEvent("PLAYER_ENTERING_WORLD")
+PvPLog:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+PvPLog:RegisterEvent("PLAYER_LOGOUT")
+
 PvPLog:SetScript("OnEvent", function(self, event, ...)
+    if event == "ADDON_LOADED" then
+        local loadedAddon = ...
+        if loadedAddon ~= addonName then
+            return
+        end
+        EnsureInitialized()
+        print("PvPLog loaded. Use /pvplogs to list saved matches. Settings: autoEnablePrompt =", tostring(PvPLogDB.settings.autoEnablePrompt))
+        -- check if already in arena at load
+        local inInstance, instanceType = IsInInstance()
+        if inInstance and (instanceType == "arena" or instanceType == "pvp") then
+            OnEnterArena()
+        end
+        return
+    end
+
+    if not addonInitialized then
+        EnsureInitialized()
+    end
+
     if event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
         -- check instance type
         local inInstance, instanceType = IsInInstance()
         if inInstance and (instanceType == "arena" or instanceType == "pvp") then
             OnEnterArena()
-        else
-            -- leaving arena
-            if inArena then
-                OnLeaveArena()
-            end
+        elseif inArena then
+            OnLeaveArena()
         end
     elseif event == "PLAYER_LOGOUT" then
         -- ensure we save end if user logs out in arena
@@ -237,11 +267,6 @@ PvPLog:SetScript("OnEvent", function(self, event, ...)
         end
     end
 end)
-
--- Register events
-PvPLog:RegisterEvent("PLAYER_ENTERING_WORLD")
-PvPLog:RegisterEvent("ZONE_CHANGED_NEW_AREA")
-PvPLog:RegisterEvent("PLAYER_LOGOUT")
 
 -- Slash commands
 SLASH_PVPLOG1 = "/pvplogs"
@@ -343,17 +368,3 @@ SlashCmdList["PVPEXPORT"] = function(msg)
     end
     print("PvPLog: match not found")
 end
-
--- Ensure DB init on addon loaded
-PvPLog:RegisterEvent("ADDON_LOADED")
-PvPLog:SetScript("OnEvent", function(self, event, arg1, ...)
-    if event == "ADDON_LOADED" and arg1 == "PvPLog" then
-        InitDB()
-        print("PvPLog loaded. Use /pvplogs to list saved matches. Settings: autoEnablePrompt =", tostring(PvPLogDB.settings.autoEnablePrompt))
-        -- check if already in arena at load
-        local inInstance, instanceType = IsInInstance()
-        if inInstance and (instanceType == "arena" or instanceType == "pvp") then
-            OnEnterArena()
-        end
-    end
-end)
