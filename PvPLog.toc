@@ -1,0 +1,6 @@
+## Interface: 100105
+## Title: PvPLog
+## Notes: Minimal addon to mark arena matches and prompt combatlog
+## Author: Andrey / PvpAnalytics
+## Version: 0.1
+PvPLog.lua
