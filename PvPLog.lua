@@ -37,6 +37,9 @@ end
 local inArena = false
 local recording = false
 local currentMatch = nil
+local ratingUpdateTimer = nil
+local lastRatingSnapshot = nil
+local matchStartTime = nil
 
 -- UI: popup frame (simple)
 local function ShowPromptEnableCombatLog()
@@ -69,7 +72,7 @@ end
 local function ShowExportDialog(text)
     if not PvPLogExportFrame then
         local f = CreateFrame("Frame", "PvPLogExportFrame", UIParent, "DialogBoxFrame")
-        f:SetSize(600, 300)
+        f:SetSize(800, 600)
         f:SetPoint("CENTER")
         f:SetMovable(true)
         f:EnableMouse(true)
@@ -83,10 +86,11 @@ local function ShowExportDialog(text)
 
         f.edit = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
         f.edit:SetMultiLine(true)
-        f.edit:SetSize(560, 200)
+        f.edit:SetSize(760, 500)
         f.edit:SetPoint("TOP", 0, -40)
         f.edit:SetAutoFocus(true)
         f.edit:HighlightText()
+        f.edit:SetFontObject("ChatFontNormal")
         f:Hide()
         PvPLogExportFrame = f
     end
@@ -146,6 +150,190 @@ local function ComputeMatchHash(map, mode, startedAt, players)
     return simpleHash(s)
 end
 
+-- Rating/MMR Tracking Functions
+local function GetArenaRatingInfo()
+    -- GetPersonalRatedInfo(bracketIndex) - 1=2v2, 2=3v3, 3=RBG
+    -- Returns: rating, seasonBest, weeklyBest, seasonPlayed, seasonWon, weeklyPlayed, weeklyWon, cap
+    local rating2v2 = 0
+    local rating3v3 = 0
+    local ok2v2, rating2v2_result = pcall(function()
+        local r = GetPersonalRatedInfo(1)
+        return r
+    end)
+    if ok2v2 and rating2v2_result then
+        rating2v2 = rating2v2_result
+    end
+    local ok3v3, rating3v3_result = pcall(function()
+        local r = GetPersonalRatedInfo(2)
+        return r
+    end)
+    if ok3v3 and rating3v3_result then
+        rating3v3 = rating3v3_result
+    end
+    -- Determine which bracket we're in based on party size
+    local numMembers = GetNumGroupMembers()
+    local bracketIndex = (numMembers and numMembers >= 3) and 2 or 1
+    local currentRating = (bracketIndex == 2) and rating3v3 or rating2v2
+    return currentRating, bracketIndex, rating2v2, rating3v3
+end
+
+local function GetArenaMMRInfo()
+    -- GetBattlefieldTeamInfo(teamIndex) - 0=player team, 1=enemy team
+    -- Returns: teamName, oldTeamRating, newTeamRating, teamRating
+    local playerMMR = nil
+    local enemyMMR = nil
+    local ok1, teamName1, oldRating1, newRating1, teamRating1 = pcall(GetBattlefieldTeamInfo, 0)
+    if ok1 and teamRating1 then
+        playerMMR = teamRating1
+    end
+    local ok2, teamName2, oldRating2, newRating2, teamRating2 = pcall(GetBattlefieldTeamInfo, 1)
+    if ok2 and teamRating2 then
+        enemyMMR = teamRating2
+    end
+    return playerMMR, enemyMMR
+end
+
+local function UpdateRatingSnapshot()
+    if not currentMatch or not inArena then
+        return
+    end
+    
+    local rating, bracketIndex, rating2v2, rating3v3 = GetArenaRatingInfo()
+    local playerMMR, enemyMMR = GetArenaMMRInfo()
+    
+    -- Set initial values if not set
+    if not currentMatch.ratingStart then
+        currentMatch.ratingStart = rating
+        currentMatch.mmrStart = playerMMR
+        currentMatch.bracketIndex = bracketIndex
+        currentMatch.rating2v2Start = rating2v2
+        currentMatch.rating3v3Start = rating3v3
+    end
+    
+    -- Always update end values
+    currentMatch.ratingEnd = rating
+    currentMatch.mmrEnd = playerMMR
+    currentMatch.rating2v2End = rating2v2
+    currentMatch.rating3v3End = rating3v3
+    
+    -- Check if rating changed since last snapshot
+    local changed = false
+    if not lastRatingSnapshot then
+        changed = true
+    elseif lastRatingSnapshot.rating ~= rating or lastRatingSnapshot.mmr ~= playerMMR then
+        changed = true
+    end
+    
+    if changed then
+        local relativeTime = matchStartTime and (GetTime() - matchStartTime) or 0
+        table.insert(currentMatch.ratingHistory, {
+            timestamp = relativeTime,
+            rating = rating,
+            mmr = playerMMR,
+            rating2v2 = rating2v2,
+            rating3v3 = rating3v3
+        })
+        lastRatingSnapshot = {
+            rating = rating,
+            mmr = playerMMR
+        }
+    end
+end
+
+-- Combat Log Event Processing
+local function ProcessCombatLogEvent()
+    if not inArena or not currentMatch then
+        return
+    end
+    
+    local timestamp, subevent, _, sourceGUID, sourceName, sourceFlags, sourceRaidFlags,
+          destGUID, destName, destFlags, destRaidFlags,
+          spellId, spellName, spellSchool,
+          amount, overkill, school, resisted, blocked, absorbed, critical, glancing, crushing, isOffHand = CombatLogGetCurrentEventInfo()
+    
+    -- Calculate relative time since match start (high precision)
+    local relativeTime = matchStartTime and (GetTime() - matchStartTime) or 0
+    
+    -- Create event record
+    local eventRecord = {
+        timestamp = relativeTime,
+        eventType = subevent,
+        sourceGUID = sourceGUID or "",
+        sourceName = sourceName or "",
+        destGUID = destGUID or "",
+        destName = destName or "",
+        spellId = spellId or 0,
+        spellName = spellName or "",
+        amount = amount or 0
+    }
+    
+    -- Add additional fields based on event type
+    if subevent == "SPELL_DAMAGE" or subevent == "SPELL_PERIODIC_DAMAGE" or subevent == "RANGE_DAMAGE" or subevent == "SWING_DAMAGE" then
+        eventRecord.overkill = overkill or 0
+        eventRecord.school = school or 0
+        eventRecord.resisted = resisted or 0
+        eventRecord.blocked = blocked or 0
+        eventRecord.absorbed = absorbed or 0
+        eventRecord.critical = critical or false
+        eventRecord.glancing = glancing or false
+        eventRecord.crushing = crushing or false
+    elseif subevent == "SPELL_HEAL" or subevent == "SPELL_PERIODIC_HEAL" then
+        eventRecord.overheal = overkill or 0 -- overkill field is used for overheal in heal events
+        eventRecord.critical = critical or false
+    elseif subevent == "SPELL_INTERRUPT" then
+        eventRecord.extraSpellId = spellId or 0
+        eventRecord.extraSpellName = spellName or ""
+    end
+    
+    -- Store event
+    table.insert(currentMatch.events, eventRecord)
+    
+    -- Update statistics
+    local stats = currentMatch.statistics
+    
+    -- Count events by type
+    stats.eventsByType[subevent] = (stats.eventsByType[subevent] or 0) + 1
+    
+    -- Track damage
+    if subevent == "SPELL_DAMAGE" or subevent == "SPELL_PERIODIC_DAMAGE" or subevent == "RANGE_DAMAGE" or subevent == "SWING_DAMAGE" then
+        local dmg = amount or 0
+        stats.totalDamage = stats.totalDamage + dmg
+        if sourceGUID then
+            stats.damageByPlayer[sourceGUID] = (stats.damageByPlayer[sourceGUID] or 0) + dmg
+        end
+    end
+    
+    -- Track healing
+    if subevent == "SPELL_HEAL" or subevent == "SPELL_PERIODIC_HEAL" then
+        local heal = amount or 0
+        stats.totalHealing = stats.totalHealing + heal
+        if sourceGUID then
+            stats.healingByPlayer[sourceGUID] = (stats.healingByPlayer[sourceGUID] or 0) + heal
+        end
+    end
+    
+    -- Track interrupts
+    if subevent == "SPELL_INTERRUPT" then
+        stats.totalInterrupts = stats.totalInterrupts + 1
+        if sourceGUID then
+            stats.interruptsByPlayer[sourceGUID] = (stats.interruptsByPlayer[sourceGUID] or 0) + 1
+        end
+    end
+end
+
+-- Rating update timer callback
+local function OnRatingUpdateTimer()
+    if inArena and currentMatch then
+        UpdateRatingSnapshot()
+    else
+        -- Stop timer if not in arena
+        if ratingUpdateTimer then
+            ratingUpdateTimer:Cancel()
+            ratingUpdateTimer = nil
+        end
+    end
+end
+
 -- When entering arena: show prompt or auto prompt
 local function OnEnterArena()
     -- if already recording, skip
@@ -157,6 +345,7 @@ local function OnEnterArena()
     local mode = "Arena"
     local players = CollectPlayers()
     local startedAt = time()
+    matchStartTime = GetTime() -- High precision time for relative event timestamps
 
     -- If auto prompt is enabled, open chat with command
     if PvPLogDB.settings.autoEnablePrompt then
@@ -174,9 +363,43 @@ local function OnEnterArena()
         startedAt = startedAt,
         endedAt = nil,
         players = players,
-        matchHash = nil
+        matchHash = nil,
+        -- Rating/MMR tracking
+        ratingStart = nil,
+        ratingEnd = nil,
+        mmrStart = nil,
+        mmrEnd = nil,
+        bracketIndex = nil,
+        rating2v2Start = nil,
+        rating2v2End = nil,
+        rating3v3Start = nil,
+        rating3v3End = nil,
+        ratingHistory = {},
+        -- Combat log events
+        events = {},
+        -- Statistics
+        statistics = {
+            totalDamage = 0,
+            totalHealing = 0,
+            totalInterrupts = 0,
+            damageByPlayer = {},
+            healingByPlayer = {},
+            interruptsByPlayer = {},
+            eventsByType = {}
+        }
     }
-    print("PvPLog: Detected arena entry on " .. tostring(map) .. ". You can enable combatlog to record details.")
+    
+    -- Initialize rating snapshot
+    lastRatingSnapshot = nil
+    UpdateRatingSnapshot()
+    
+    -- Start periodic rating updates (every 5 seconds)
+    if ratingUpdateTimer then
+        ratingUpdateTimer:Cancel()
+    end
+    ratingUpdateTimer = C_Timer.NewTicker(5, OnRatingUpdateTimer)
+    
+    print("PvPLog: Detected arena entry on " .. tostring(map) .. ". Recording combat log events and rating changes.")
 end
 
 -- When leaving arena: finalize match
@@ -184,10 +407,19 @@ local function OnLeaveArena()
     if not inArena then return end
     inArena = false
 
+    -- Stop rating update timer
+    if ratingUpdateTimer then
+        ratingUpdateTimer:Cancel()
+        ratingUpdateTimer = nil
+    end
+
     if not currentMatch then
         return
     end
 
+    -- Final rating snapshot
+    UpdateRatingSnapshot()
+    
     currentMatch.endedAt = time()
     currentMatch.duration = currentMatch.endedAt - currentMatch.startedAt
     currentMatch.matchHash = ComputeMatchHash(currentMatch.map, currentMatch.mode, currentMatch.startedAt, currentMatch.players)
@@ -210,11 +442,15 @@ local function OnLeaveArena()
         local newId = (#PvPLogDB.matches) + 1
         currentMatch.id = newId
         table.insert(PvPLogDB.matches, currentMatch)
-        print("PvPLog: Saved match #" .. tostring(newId) .. " (" .. tostring(currentMatch.duration) .. " sec). Use /pvplogs to list or /pvpexport " .. tostring(newId) .. " to copy JSON.")
+        local eventCount = #currentMatch.events
+        local ratingChange = (currentMatch.ratingEnd or 0) - (currentMatch.ratingStart or 0)
+        print("PvPLog: Saved match #" .. tostring(newId) .. " (" .. tostring(currentMatch.duration) .. " sec, " .. tostring(eventCount) .. " events, rating: " .. tostring(ratingChange) .. "). Use /pvplogs to list or /pvpexport " .. tostring(newId) .. " to copy JSON.")
     end
 
     -- clear current
     currentMatch = nil
+    lastRatingSnapshot = nil
+    matchStartTime = nil
 end
 
 local addonInitialized = false
@@ -231,6 +467,10 @@ PvPLog:RegisterEvent("ADDON_LOADED")
 PvPLog:RegisterEvent("PLAYER_ENTERING_WORLD")
 PvPLog:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 PvPLog:RegisterEvent("PLAYER_LOGOUT")
+PvPLog:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+PvPLog:RegisterEvent("ARENA_PREP_OPPONENT_SPECIALIZATIONS")
+PvPLog:RegisterEvent("ARENA_OPPONENT_UPDATE")
+PvPLog:RegisterEvent("UPDATE_BATTLEFIELD_STATUS")
 
 PvPLog:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -265,8 +505,86 @@ PvPLog:SetScript("OnEvent", function(self, event, ...)
         if inArena then
             OnLeaveArena()
         end
+    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+        -- Process all combat log events
+        ProcessCombatLogEvent()
+    elseif event == "ARENA_PREP_OPPONENT_SPECIALIZATIONS" or event == "ARENA_OPPONENT_UPDATE" or event == "UPDATE_BATTLEFIELD_STATUS" then
+        -- Update rating snapshot on arena-related events
+        if inArena and currentMatch then
+            UpdateRatingSnapshot()
+        end
     end
 end)
+
+-- JSON Serialization Helper
+local function EscapeJsonString(str)
+    if not str then return "" end
+    str = tostring(str)
+    str = str:gsub("\\", "\\\\")
+    str = str:gsub('"', '\\"')
+    str = str:gsub("\n", "\\n")
+    str = str:gsub("\r", "\\r")
+    str = str:gsub("\t", "\\t")
+    return str
+end
+
+local function SerializeToJson(value, indent)
+    indent = indent or 0
+    local indentStr = string.rep("  ", indent)
+    local nextIndent = indent + 1
+    local nextIndentStr = string.rep("  ", nextIndent)
+    
+    if type(value) == "table" then
+        -- Check if it's an array (sequential numeric indices)
+        local isArray = true
+        local maxIndex = 0
+        local count = 0
+        for k, v in pairs(value) do
+            count = count + 1
+            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
+                isArray = false
+                break
+            end
+            if k > maxIndex then
+                maxIndex = k
+            end
+        end
+        
+        if isArray and maxIndex == count then
+            -- It's an array
+            if maxIndex == 0 then
+                return "[]"
+            end
+            local parts = {}
+            for i = 1, maxIndex do
+                table.insert(parts, SerializeToJson(value[i], nextIndent))
+            end
+            return "[\n" .. nextIndentStr .. table.concat(parts, ",\n" .. nextIndentStr) .. "\n" .. indentStr .. "]"
+        else
+            -- It's an object
+            local parts = {}
+            for k, v in pairs(value) do
+                local key = EscapeJsonString(tostring(k))
+                local val = SerializeToJson(v, nextIndent)
+                table.insert(parts, '"' .. key .. '": ' .. val)
+            end
+            if #parts == 0 then
+                return "{}"
+            end
+            return "{\n" .. nextIndentStr .. table.concat(parts, ",\n" .. nextIndentStr) .. "\n" .. indentStr .. "}"
+        end
+    elseif type(value) == "string" then
+        return '"' .. EscapeJsonString(value) .. '"'
+    elseif type(value) == "number" then
+        return tostring(value)
+    elseif type(value) == "boolean" then
+        return value and "true" or "false"
+    elseif value == nil then
+        return "null"
+    else
+        return '"' .. EscapeJsonString(tostring(value)) .. '"'
+    end
+end
 
 -- Slash commands
 SLASH_PVPLOG1 = "/pvplogs"
@@ -280,9 +598,16 @@ SlashCmdList["PVPLOG"] = function(msg)
         end
         print("PvPLog: Saved matches:")
         for _, m in ipairs(PvPLogDB.matches) do
-            print(string.format("  id=%d  map=%s  mode=%s  start=%s  dur=%ds  hash=%s",
+            local ratingInfo = ""
+            if m.ratingStart and m.ratingEnd then
+                local change = m.ratingEnd - m.ratingStart
+                local changeStr = change >= 0 and ("+" .. tostring(change)) or tostring(change)
+                ratingInfo = string.format(" rating:%d->%d (%s)", m.ratingStart, m.ratingEnd, changeStr)
+            end
+            local eventCount = m.events and #m.events or 0
+            print(string.format("  id=%d  map=%s  mode=%s  start=%s  dur=%ds  events=%d%s  hash=%s",
                 m.id, tostring(m.map), tostring(m.mode),
-                date("%Y-%m-%d %H:%M:%S", m.startedAt), m.duration or 0, m.matchHash or ""))
+                date("%Y-%m-%d %H:%M:%S", m.startedAt), m.duration or 0, eventCount, ratingInfo, m.matchHash or ""))
         end
         print("Use /pvpexport <id> to show JSON for a match.")
     else
@@ -302,48 +627,8 @@ SlashCmdList["PVPLOG"] = function(msg)
                 print("PvPLog: match not found")
                 return
             end
-            local ok, json = pcall(function() return LibSerialize and LibSerialize:Serialize(found) end)
-            -- We don't rely on LibSerialize. Build a simple JSON manually.
-            local export = {}
-            export.id = found.id
-            export.map = found.map
-            export.mode = found.mode
-            export.startedAt = found.startedAt
-            export.endedAt = found.endedAt
-            export.duration = found.duration
-            export.matchHash = found.matchHash
-            export.players = found.players
-            -- convert to JSON (simple)
-            local function simple_serialize_table(t)
-                local s = "{"
-                local first = true
-                for k, v in pairs(t) do
-                    if not first then s = s .. "," end
-                    first = false
-                    local key = tostring(k)
-                    if type(v) == "table" then
-                        s = s .. '"'..key..'":'..simple_serialize_table(v)
-                    elseif type(v) == "string" then
-                        s = s .. '"'..key..'":"'..v..'"'
-                    else
-                        s = s .. '"'..key..'":'..tostring(v)
-                    end
-                end
-                s = s .. "}"
-                return s
-            end
-            -- build players array
-            local playersJson = "["
-            for i,p in ipairs(found.players) do
-                if i>1 then playersJson = playersJson .. "," end
-                playersJson = playersJson .. string.format('{"name":"%s","realm":"%s","guid":"%s"}',
-                    tostring(p.name or ""), tostring(p.realm or ""), tostring(p.guid or ""))
-            end
-            playersJson = playersJson .. "]"
-
-            local jsonText = string.format('{"id":%d,"map":"%s","mode":"%s","startedAt":%d,"endedAt":%d,"duration":%d,"matchHash":"%s","players":%s}',
-                export.id, tostring(export.map or ""), tostring(export.mode or ""), export.startedAt or 0, export.endedAt or 0, export.duration or 0, tostring(export.matchHash or ""), playersJson)
-
+            -- Serialize entire match data to JSON
+            local jsonText = SerializeToJson(found)
             ShowExportDialog(jsonText)
         else
             print("PvPLog: unknown command. Usage: /pvplogs or /pvplogs export <id>")
@@ -360,8 +645,8 @@ SlashCmdList["PVPEXPORT"] = function(msg)
     end
     for _, m in ipairs(PvPLogDB.matches) do
         if m.id == id then
-            local jsonText = string.format('{"id":%d,"map":"%s","mode":"%s","startedAt":%d,"endedAt":%d,"duration":%d,"matchHash":"%s","players":%s}',
-                m.id, tostring(m.map or ""), tostring(m.mode or ""), m.startedAt or 0, m.endedAt or 0, m.duration or 0, tostring(m.matchHash or ""), "[]")
+            -- Serialize entire match data to JSON
+            local jsonText = SerializeToJson(m)
             ShowExportDialog(jsonText)
             return
         end
