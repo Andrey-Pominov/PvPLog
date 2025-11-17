@@ -12,7 +12,10 @@ PvPLog is a comprehensive World of Warcraft addon for retail that tracks your ar
   - Damage/healing/interrupts broken down by player
   - Event counts by type
 - **Match Metadata**: Records map, start/end timestamps, duration, and player rosters (allies and opponents).
+- **Class & Specialization Detection**: Automatically detects and records class and specialization for all players (allies and opponents).
+- **Database Management**: Comprehensive commands to manage your match database (delete, clear, search, stats, info).
 - **Export Functionality**: Provides `/pvplogs` to list saved matches and `/pvpexport <id>` to export complete match data as JSON.
+- **Auto Export**: Option to automatically show export dialog after each match is saved.
 - **Combat Log Prompt**: Optionally prompts you to enable `/combatlog` for external log files, with an option to toggle automatic prompting.
 
 ## Installation
@@ -46,15 +49,45 @@ The addon declares the `PvPLogDB` SavedVariables table where it stores persisten
 - **Viewing Matches**: 
   - Run `/pvplogs` to see a list of all saved matches with rating info and event counts
   - Use `/pvplogs export <id>` or `/pvpexport <id>` to open a copyable JSON dialog with complete match data
+  - Use `/pvplogs info <id>` to see detailed match information including player classes and specializations
+
+- **Database Management**:
+  - `/pvplogs delete <id>` - Delete a specific match (with confirmation)
+  - `/pvplogs clear` - Clear all matches (with confirmation)
+  - `/pvplogs search <term>` - Search matches by map name or player name
+  - `/pvplogs stats` - Show overall statistics (total matches, events, averages, rating changes)
+  - `/pvplogs autoexport <on|off>` - Enable/disable automatic export dialog after matches
+
+- **Auto Export**:
+  - Enable with `/pvplogs autoexport on`
+  - When enabled, the export dialog automatically appears after each match is saved
+  - Allows you to quickly copy match data without manual commands
 
 ## Exported Data
 
 The JSON export includes:
 - **Match Info**: ID, map, mode, timestamps, duration, hash
-- **Players**: Names, realms, GUIDs for all participants (allies and opponents)
+- **Players**: Names, realms, GUIDs, class, classId, specialization, and specId for all participants (allies and opponents)
 - **Rating/MMR**: Start/end values, bracket info (2v2/3v3), and history of changes during the match
 - **Events**: Complete array of all combat log events with timestamps, sources, targets, spells, amounts, and event-specific details
 - **Statistics**: Aggregated stats including total damage/healing/interrupts, per-player breakdowns, and event type counts
+
+## Commands Reference
+
+### Main Commands
+- `/pvplogs` - List all saved matches
+- `/pvplogs export <id>` - Export match as JSON (opens dialog)
+- `/pvpexport <id>` - Same as above (shorthand)
+
+### Database Management
+- `/pvplogs delete <id>` - Delete a specific match
+- `/pvplogs clear` - Delete all matches (with confirmation)
+- `/pvplogs search <term>` - Search matches by map or player name
+- `/pvplogs stats` - Show overall statistics
+- `/pvplogs info <id>` - Show detailed match information
+
+### Settings
+- `/pvplogs autoexport <on|off>` - Toggle automatic export after matches
 
 ## Development Notes
 
@@ -64,5 +97,6 @@ The JSON export includes:
 - JSON serialization is handled by a custom implementation that properly handles nested arrays and objects.
 - Combat log events are captured via `COMBAT_LOG_EVENT_UNFILTERED` and processed in real-time.
 - Rating/MMR tracking uses `GetPersonalRatedInfo` and `GetBattlefieldTeamInfo` APIs, with periodic updates and event-driven snapshots.
+- Class/spec detection uses `UnitClass`, `GetSpecializationInfo`, `GetArenaOpponentSpec`, and `GetInspectSpecialization` APIs.
 - All timestamps use high-precision `GetTime()` for relative event timing.
 
