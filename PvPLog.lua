@@ -14,7 +14,16 @@ local function InitDB()
         PvPLogDB = {}
     end
     if not PvPLogDB.settings then
-        PvPLogDB.settings = { autoEnablePrompt = false } -- default: don't auto-enable prompts
+        PvPLogDB.settings = { 
+            autoEnablePrompt = false, -- default: don't auto-enable prompts
+            autoExport = false -- default: don't auto-export
+        }
+    end
+    if not PvPLogDB.settings.autoEnablePrompt then
+        PvPLogDB.settings.autoEnablePrompt = false
+    end
+    if PvPLogDB.settings.autoExport == nil then
+        PvPLogDB.settings.autoExport = false
     end
     if not PvPLogDB.matches then
         PvPLogDB.matches = {}
@@ -68,6 +77,43 @@ local function ShowPromptEnableCombatLog()
     StaticPopup_Show("PVPLOG_ENABLE_COMBATLOG")
 end
 
+-- Confirmation dialogs for delete and clear
+local function InitConfirmationDialogs()
+    if StaticPopupDialogs["PVPLOG_DELETE_MATCH"] == nil then
+        StaticPopupDialogs["PVPLOG_DELETE_MATCH"] = {
+            text = "PvPLog: Delete match #%d?",
+            button1 = "Delete",
+            button2 = "Cancel",
+            OnAccept = function(self, data)
+                if data and data.index then
+                    table.remove(PvPLogDB.matches, data.index)
+                    print("PvPLog: Match #" .. tostring(data.id) .. " deleted.")
+                end
+            end,
+            timeout = 0,
+            whileDead = true,
+            hideOnEscape = true,
+            preferredIndex = 3,
+        }
+    end
+    if StaticPopupDialogs["PVPLOG_CLEAR_ALL"] == nil then
+        StaticPopupDialogs["PVPLOG_CLEAR_ALL"] = {
+            text = "PvPLog: Delete all %d matches? This cannot be undone!",
+            button1 = "Delete All",
+            button2 = "Cancel",
+            OnAccept = function()
+                local count = #PvPLogDB.matches
+                PvPLogDB.matches = {}
+                print("PvPLog: Deleted all " .. tostring(count) .. " matches.")
+            end,
+            timeout = 0,
+            whileDead = true,
+            hideOnEscape = true,
+            preferredIndex = 3,
+        }
+    end
+end
+
 -- Create export popup dialog on demand (copyable textbox)
 local function ShowExportDialog(text)
     if not PvPLogExportFrame then
@@ -101,13 +147,77 @@ local function ShowExportDialog(text)
     PvPLogExportFrame.edit:HighlightText()
 end
 
+-- Helper to get class and spec info for a unit
+local function GetPlayerClassSpec(unit)
+    local className, classId = nil, nil
+    local specName, specId = nil, nil
+    
+    -- Get class info
+    if UnitExists(unit) then
+        local ok, class, id = pcall(UnitClass, unit)
+        if ok and class then
+            className = class
+            classId = id
+        end
+    end
+    
+    -- Get spec info
+    if unit == "player" then
+        -- For player, use GetSpecialization
+        local specIndex = GetSpecialization()
+        if specIndex then
+            local ok, name, desc, icon, role, classFile, id = pcall(GetSpecializationInfo, specIndex)
+            if ok and name then
+                specName = name
+                specId = id
+            end
+        end
+    else
+        -- For other units, try GetInspectSpecialization
+        local ok, specIdResult = pcall(GetInspectSpecialization, unit)
+        if ok and specIdResult and specIdResult > 0 then
+            specId = specIdResult
+            local ok2, name, desc, icon, role, classFile, id = pcall(GetSpecializationInfoByID, specIdResult)
+            if ok2 and name then
+                specName = name
+            end
+        end
+    end
+    
+    return className, classId, specName, specId
+end
+
+-- Helper to get arena opponent spec
+local function GetArenaOpponentSpecInfo(index)
+    local specName, specId = nil, nil
+    local ok, specIdResult = pcall(GetArenaOpponentSpec, index)
+    if ok and specIdResult and specIdResult > 0 then
+        specId = specIdResult
+        local ok2, name, desc, icon, role, classFile, id = pcall(GetSpecializationInfoByID, specIdResult)
+        if ok2 and name then
+            specName = name
+        end
+    end
+    return specName, specId
+end
+
 -- Helpers to collect players: gather party/raid and opponents if available
 local function CollectPlayers()
     local players = {}
+    local realm = GetRealmName()
+    
     -- add local player
     local pname = UnitName("player")
-    local realm = GetRealmName()
-    table.insert(players, { name = pname, realm = realm, role = nil, guid = UnitGUID("player") })
+    local className, classId, specName, specId = GetPlayerClassSpec("player")
+    table.insert(players, { 
+        name = pname, 
+        realm = realm, 
+        guid = UnitGUID("player"),
+        class = className or "Unknown",
+        classId = classId or 0,
+        spec = specName or "Unknown",
+        specId = specId or 0
+    })
 
     -- party members (arena usually is party-based)
     local num = GetNumGroupMembers()
@@ -119,7 +229,16 @@ local function CollectPlayers()
             if UnitExists(unit) then
                 local name = UnitName(unit)
                 local guid = UnitGUID(unit)
-                table.insert(players, { name = name, realm = realm, role = nil, guid = guid })
+                local className, classId, specName, specId = GetPlayerClassSpec(unit)
+                table.insert(players, { 
+                    name = name, 
+                    realm = realm, 
+                    guid = guid,
+                    class = className or "Unknown",
+                    classId = classId or 0,
+                    spec = specName or "Unknown",
+                    specId = specId or 0
+                })
             end
         end
     end
@@ -133,7 +252,40 @@ local function CollectPlayers()
             if UnitExists(unit) then
                 local name = UnitName(unit)
                 local guid = UnitGUID(unit)
-                table.insert(players, { name = name, realm = nil, role = nil, guid = guid })
+                local className, classId = nil, nil
+                local specName, specId = nil, nil
+                
+                -- Try to get class
+                local ok2, class, id = pcall(UnitClass, unit)
+                if ok2 and class then
+                    className = class
+                    classId = id
+                end
+                
+                -- Try to get spec from GetArenaOpponentSpec
+                specName, specId = GetArenaOpponentSpecInfo(i)
+                
+                -- Fallback: try GetInspectSpecialization
+                if not specId then
+                    local ok3, specIdResult = pcall(GetInspectSpecialization, unit)
+                    if ok3 and specIdResult and specIdResult > 0 then
+                        specId = specIdResult
+                        local ok4, name, desc, icon, role, classFile, id = pcall(GetSpecializationInfoByID, specIdResult)
+                        if ok4 and name then
+                            specName = name
+                        end
+                    end
+                end
+                
+                table.insert(players, { 
+                    name = name, 
+                    realm = nil, 
+                    guid = guid,
+                    class = className or "Unknown",
+                    classId = classId or 0,
+                    spec = specName or "Unknown",
+                    specId = specId or 0
+                })
             end
         end
     end
@@ -433,6 +585,7 @@ local function OnLeaveArena()
         end
     end
 
+    local savedMatch = nil
     if duplicate then
         print("PvPLog: Match already exists in DB (duplicate detected).")
         -- Optionally merge missing players if any
@@ -442,9 +595,19 @@ local function OnLeaveArena()
         local newId = (#PvPLogDB.matches) + 1
         currentMatch.id = newId
         table.insert(PvPLogDB.matches, currentMatch)
+        savedMatch = currentMatch
         local eventCount = #currentMatch.events
         local ratingChange = (currentMatch.ratingEnd or 0) - (currentMatch.ratingStart or 0)
         print("PvPLog: Saved match #" .. tostring(newId) .. " (" .. tostring(currentMatch.duration) .. " sec, " .. tostring(eventCount) .. " events, rating: " .. tostring(ratingChange) .. "). Use /pvplogs to list or /pvpexport " .. tostring(newId) .. " to copy JSON.")
+        
+        -- Auto-export if enabled
+        if PvPLogDB.settings.autoExport and savedMatch then
+            C_Timer.After(0.5, function()
+                local jsonText = SerializeToJson(savedMatch)
+                ShowExportDialog(jsonText)
+                print("PvPLog: Auto-exported match #" .. tostring(newId))
+            end)
+        end
     end
 
     -- clear current
@@ -479,7 +642,9 @@ PvPLog:SetScript("OnEvent", function(self, event, ...)
             return
         end
         EnsureInitialized()
-        print("PvPLog loaded. Use /pvplogs to list saved matches. Settings: autoEnablePrompt =", tostring(PvPLogDB.settings.autoEnablePrompt))
+        InitConfirmationDialogs()
+        print("PvPLog loaded. Use /pvplogs to list saved matches.")
+        print("Settings: autoEnablePrompt =", tostring(PvPLogDB.settings.autoEnablePrompt), "autoExport =", tostring(PvPLogDB.settings.autoExport))
         -- check if already in arena at load
         local inInstance, instanceType = IsInInstance()
         if inInstance and (instanceType == "arena" or instanceType == "pvp") then
@@ -609,10 +774,12 @@ SlashCmdList["PVPLOG"] = function(msg)
                 m.id, tostring(m.map), tostring(m.mode),
                 date("%Y-%m-%d %H:%M:%S", m.startedAt), m.duration or 0, eventCount, ratingInfo, m.matchHash or ""))
         end
-        print("Use /pvpexport <id> to show JSON for a match.")
+        print("Commands: /pvplogs delete <id>, /pvplogs clear, /pvplogs search <term>, /pvplogs stats, /pvplogs info <id>, /pvplogs autoexport <on|off>")
     else
-        -- try to export single
         local cmd, arg = msg:match("^(%S+)%s*(.-)$")
+        cmd = cmd and cmd:lower() or ""
+        arg = arg and arg:trim() or ""
+        
         if cmd == "export" and arg ~= "" then
             local id = tonumber(arg)
             if not id then
@@ -630,8 +797,163 @@ SlashCmdList["PVPLOG"] = function(msg)
             -- Serialize entire match data to JSON
             local jsonText = SerializeToJson(found)
             ShowExportDialog(jsonText)
+        elseif cmd == "delete" and arg ~= "" then
+            local id = tonumber(arg)
+            if not id then
+                print("PvPLog: invalid id")
+                return
+            end
+            local foundIndex = nil
+            for i, m in ipairs(PvPLogDB.matches) do
+                if m.id == id then
+                    foundIndex = i
+                    break
+                end
+            end
+            if not foundIndex then
+                print("PvPLog: match not found")
+                return
+            end
+            -- Confirmation dialog
+            InitConfirmationDialogs()
+            StaticPopup_Show("PVPLOG_DELETE_MATCH", tostring(id), nil, { id = id, index = foundIndex })
+        elseif cmd == "clear" then
+            if #PvPLogDB.matches == 0 then
+                print("PvPLog: No matches to clear.")
+                return
+            end
+            InitConfirmationDialogs()
+            StaticPopup_Show("PVPLOG_CLEAR_ALL", tostring(#PvPLogDB.matches))
+        elseif cmd == "search" and arg ~= "" then
+            local term = arg:lower()
+            local found = {}
+            for _, m in ipairs(PvPLogDB.matches) do
+                local match = false
+                -- Search in map name
+                if m.map and tostring(m.map):lower():find(term, 1, true) then
+                    match = true
+                end
+                -- Search in player names
+                if not match and m.players then
+                    for _, p in ipairs(m.players) do
+                        if p.name and tostring(p.name):lower():find(term, 1, true) then
+                            match = true
+                            break
+                        end
+                    end
+                end
+                if match then
+                    table.insert(found, m)
+                end
+            end
+            if #found == 0 then
+                print("PvPLog: No matches found for '" .. arg .. "'")
+            else
+                print("PvPLog: Found " .. tostring(#found) .. " match(es) for '" .. arg .. "':")
+                for _, m in ipairs(found) do
+                    local eventCount = m.events and #m.events or 0
+                    print(string.format("  id=%d  map=%s  start=%s  dur=%ds  events=%d",
+                        m.id, tostring(m.map), date("%Y-%m-%d %H:%M:%S", m.startedAt), m.duration or 0, eventCount))
+                end
+            end
+        elseif cmd == "stats" then
+            local totalMatches = #PvPLogDB.matches
+            if totalMatches == 0 then
+                print("PvPLog: No matches saved.")
+                return
+            end
+            local totalEvents = 0
+            local totalDuration = 0
+            local totalRatingChange = 0
+            for _, m in ipairs(PvPLogDB.matches) do
+                if m.events then
+                    totalEvents = totalEvents + #m.events
+                end
+                if m.duration then
+                    totalDuration = totalDuration + m.duration
+                end
+                if m.ratingStart and m.ratingEnd then
+                    totalRatingChange = totalRatingChange + (m.ratingEnd - m.ratingStart)
+                end
+            end
+            local avgDuration = totalMatches > 0 and (totalDuration / totalMatches) or 0
+            local avgEvents = totalMatches > 0 and (totalEvents / totalMatches) or 0
+            print("PvPLog Statistics:")
+            print("  Total matches: " .. tostring(totalMatches))
+            print("  Total events: " .. tostring(totalEvents))
+            print("  Average duration: " .. string.format("%.1f", avgDuration) .. " seconds")
+            print("  Average events per match: " .. string.format("%.1f", avgEvents))
+            if totalRatingChange ~= 0 then
+                print("  Total rating change: " .. tostring(totalRatingChange))
+            end
+        elseif cmd == "info" and arg ~= "" then
+            local id = tonumber(arg)
+            if not id then
+                print("PvPLog: invalid id")
+                return
+            end
+            local found = nil
+            for _, m in ipairs(PvPLogDB.matches) do
+                if m.id == id then found = m; break end
+            end
+            if not found then
+                print("PvPLog: match not found")
+                return
+            end
+            print("PvPLog Match #" .. tostring(id) .. " Details:")
+            print("  Map: " .. tostring(found.map or "Unknown"))
+            print("  Mode: " .. tostring(found.mode or "Unknown"))
+            print("  Started: " .. date("%Y-%m-%d %H:%M:%S", found.startedAt or 0))
+            print("  Ended: " .. date("%Y-%m-%d %H:%M:%S", found.endedAt or 0))
+            print("  Duration: " .. tostring(found.duration or 0) .. " seconds")
+            if found.ratingStart then
+                print("  Rating: " .. tostring(found.ratingStart) .. " -> " .. tostring(found.ratingEnd or found.ratingStart))
+            end
+            if found.mmrStart then
+                print("  MMR: " .. tostring(found.mmrStart) .. " -> " .. tostring(found.mmrEnd or found.mmrStart))
+            end
+            local eventCount = found.events and #found.events or 0
+            print("  Events: " .. tostring(eventCount))
+            if found.statistics then
+                print("  Total Damage: " .. tostring(found.statistics.totalDamage or 0))
+                print("  Total Healing: " .. tostring(found.statistics.totalHealing or 0))
+                print("  Total Interrupts: " .. tostring(found.statistics.totalInterrupts or 0))
+            end
+            if found.players and #found.players > 0 then
+                print("  Players (" .. tostring(#found.players) .. "):")
+                for _, p in ipairs(found.players) do
+                    local playerInfo = "    - " .. tostring(p.name or "Unknown")
+                    if p.class and p.class ~= "Unknown" then
+                        playerInfo = playerInfo .. " (" .. p.class
+                        if p.spec and p.spec ~= "Unknown" then
+                            playerInfo = playerInfo .. " " .. p.spec
+                        end
+                        playerInfo = playerInfo .. ")"
+                    end
+                    print(playerInfo)
+                end
+            end
+        elseif cmd == "autoexport" then
+            if arg == "on" or arg == "1" or arg == "true" then
+                PvPLogDB.settings.autoExport = true
+                print("PvPLog: Auto-export enabled. Matches will be automatically exported when saved.")
+            elseif arg == "off" or arg == "0" or arg == "false" then
+                PvPLogDB.settings.autoExport = false
+                print("PvPLog: Auto-export disabled.")
+            else
+                local status = PvPLogDB.settings.autoExport and "enabled" or "disabled"
+                print("PvPLog: Auto-export is currently " .. status .. ". Use /pvplogs autoexport <on|off> to change.")
+            end
         else
-            print("PvPLog: unknown command. Usage: /pvplogs or /pvplogs export <id>")
+            print("PvPLog: unknown command. Usage:")
+            print("  /pvplogs - list matches")
+            print("  /pvplogs export <id> - export match JSON")
+            print("  /pvplogs delete <id> - delete a match")
+            print("  /pvplogs clear - clear all matches")
+            print("  /pvplogs search <term> - search matches")
+            print("  /pvplogs stats - show statistics")
+            print("  /pvplogs info <id> - show match details")
+            print("  /pvplogs autoexport <on|off> - toggle auto-export")
         end
     end
 end
