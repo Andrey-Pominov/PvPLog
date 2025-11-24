@@ -1,8 +1,8 @@
 ## Interface: 100207
 ## Title: PvPAnalytics
-## Notes: PvP analytics logging addon
+## Notes: Advanced Arena and PvP Logging
 ## Author: Rmpriest
-## Version: 1.0
+## Version: 2.0
 ## SavedVariables: PvPAnalyticsDB
 
 PvPAnalytics.lua
