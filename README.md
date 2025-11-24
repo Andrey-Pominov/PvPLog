@@ -9,6 +9,10 @@ PvPAnalytics is a World of Warcraft addon for retail that tracks your arena and 
 - **Statistics Tracking**: Calculates real-time statistics including:
   - Total damage, healing, interrupts, and critical hits
   - Damage/healing/interrupts/crits broken down by player (GUID-based)
+  - CC chains, trinket usage, and big button (cooldown/racial) usage
+- **CC Chain Detection**: Automatically detects when multiple crowd control effects are applied to the same target in quick succession (within 5 seconds).
+- **Trinket Tracking**: Monitors PvP trinket usage and detects when trinkets are used to break crowd control effects.
+- **Big Button Tracking**: Tracks major offensive/defensive cooldowns and racial abilities (e.g., Avenging Wrath, Combustion, Will of the Forsaken).
 - **Match Metadata**: Records map, start/end timestamps, arena mode (2v2, 3v3, Solo Shuffle, 1v1), and player rosters.
 - **Class & Specialization Detection**: Automatically detects and records class and specialization for all players (allies and opponents).
 - **Faction Tracking**: Records faction (Alliance/Horde) for all players.
@@ -36,6 +40,9 @@ The addon declares the `PvPAnalyticsDB` SavedVariables table where it stores mat
   - Updates statistics in real-time
   - Logs important events with timestamps
   - Tracks critical hits separately
+  - Detects CC chains when multiple crowd control effects are applied in sequence
+  - Monitors trinket usage and whether it breaks active CC
+  - Tracks major cooldowns and racial abilities (big buttons)
   - Updates player information when arena opponent specializations become available
 
 - **Leaving the Match**: When you leave, the addon:
@@ -76,26 +83,33 @@ Each saved match includes:
   - `isPlayer` - Boolean indicating if player is on your team (true) or enemy (false)
 
 - **Statistics**: Aggregated stats:
-  - `totalDamage` - Total damage dealt
-  - `totalHealing` - Total healing done
-  - `totalInterrupts` - Total interrupts
-  - `totalCrits` - Total critical hits
-  - `damageByPlayer` - Damage per player (GUID-indexed)
-  - `healingByPlayer` - Healing per player (GUID-indexed)
-  - `interruptsByPlayer` - Interrupts per player (GUID-indexed)
-  - `critsByPlayer` - Critical hits per player (GUID-indexed)
+  - `damage` - Damage per player (GUID-indexed)
+  - `healing` - Healing per player (GUID-indexed)
+  - `absorbs` - Absorbs per player (GUID-indexed)
+  - `interrupts` - Interrupts per player (GUID-indexed)
+  - `ccChains` - CC chains initiated per player (GUID-indexed)
+  - `trinketUsage` - Trinket uses per player (GUID-indexed)
+  - `bigButtonUsage` - Big button (cooldown/racial) uses per player (GUID-indexed)
 
-- **Logs**: Array of text log entries with timestamps showing important events:
-  - Damage events with critical hit indicators
-  - Healing events with critical hit indicators
+- **Events**: Array of event entries with timestamps showing important combat events:
+  - Damage and healing events
   - Interrupt events
+  - Death events
+  - CC events (stuns, silences, incapacitates, etc.) with APPLIED/REMOVED status
+  - CC_CHAIN events showing sequences of crowd control applied to targets
+  - TRINKET events showing trinket usage and whether CC was broken
+  - BIG_BUTTON events showing major cooldown and racial ability usage (categorized as OFFENSIVE/DEFENSIVE/RACIAL)
+  - DEFENSIVE and BURST events for major defensive and offensive cooldowns
 
 ## Development Notes
 
-- Core logic resides in `PvPAnalytics.lua`.
+- Core logic resides in `PvPAnalytics.lua` with combat log processing in `CombatLog.lua` and spell definitions in `Constants.lua`.
 - Event-driven architecture using WoW's event system.
 - The addon uses Blizzard-provided APIs only; no external libraries are required.
 - Combat log events are captured via `COMBAT_LOG_EVENT_UNFILTERED` and processed in real-time.
+- CC chain detection uses a 5-second time window to identify consecutive crowd control applications on the same target.
+- Trinket tracking monitors `SPELL_CAST_SUCCESS` events for PvP trinket spell IDs and checks for active CC debuffs.
+- Big button tracking captures major cooldowns (BURST/DEFENSIVE) and racial abilities via `SPELL_CAST_SUCCESS` events.
 - Class/spec detection uses `UnitClass`, `GetSpecializationInfo`, `GetArenaOpponentSpec`, and `GetInspectSpecialization` APIs.
 - Arena mode detection is based on party/raid size.
 - Player information is refreshed when `ARENA_PREP_OPPONENT_SPECIALIZATIONS` or `ARENA_OPPONENT_UPDATE` events fire.
