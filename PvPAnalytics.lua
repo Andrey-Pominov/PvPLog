@@ -55,14 +55,23 @@ function addon:StartMatch()
             winner = nil
         },
         players = {}, -- Helper to store name/class info
-        events = {},  -- For the Timeline (CC, Deaths, CDs)
+        events = {},  -- For the Timeline (CC, Deaths, CDs, CC Chains, Trinkets, Big Buttons)
         stats = {
             damage = {},
             healing = {},
             absorbs = {},
-            interrupts = {}
+            interrupts = {},
+            ccChains = {},
+            trinketUsage = {},
+            bigButtonUsage = {}
         }
     }
+    
+    -- Reset CC chain tracking (if CombatLog module is loaded)
+    if addon.ResetCCTracking then
+        addon:ResetCCTracking()
+    end
+    
     print("|cff00ff00[PvPAnalytics]|r Match Started: " .. mapName)
 end
 
@@ -73,6 +82,11 @@ function addon:EndMatch()
         table.insert(PvPAnalyticsDB.matches, addon.CurrentMatch)
         print("|cff00ff00[PvPAnalytics]|r Match Ended & Saved.")
         addon.CurrentMatch = nil
+    end
+    
+    -- Reset CC chain tracking
+    if addon.ResetCCTracking then
+        addon:ResetCCTracking()
     end
 end
 

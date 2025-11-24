@@ -1,5 +1,9 @@
 local _, addon = ...
 
+-- CC Chain tracking: stores recent CC applications per target
+local recentCCs = {} -- Format: [destGUID] = { {time, spellId, spellName, sourceName}, ... }
+local CC_CHAIN_WINDOW = 5.0 -- seconds
+
 -- Helper to ensure player tables exist in stats
 local function InitPlayer(guid, name)
     if not addon.CurrentMatch.stats.damage[guid] then
@@ -7,8 +11,43 @@ local function InitPlayer(guid, name)
         addon.CurrentMatch.stats.healing[guid] = 0
         addon.CurrentMatch.stats.absorbs[guid] = 0
         addon.CurrentMatch.stats.interrupts[guid] = 0
+        addon.CurrentMatch.stats.ccChains[guid] = 0
+        addon.CurrentMatch.stats.trinketUsage[guid] = 0
+        addon.CurrentMatch.stats.bigButtonUsage[guid] = 0
         addon.CurrentMatch.players[guid] = { name = name }
     end
+end
+
+-- Helper to check if target has active CC debuff
+local function HasActiveCC(targetGUID, currentTime)
+    if not recentCCs[targetGUID] then return false end
+    
+    for _, ccData in ipairs(recentCCs[targetGUID]) do
+        -- Check if CC is still active (within window and not removed)
+        if currentTime - ccData.time < CC_CHAIN_WINDOW then
+            return true, ccData
+        end
+    end
+    return false
+end
+
+-- Helper to clean old CC entries
+local function CleanOldCCs(currentTime)
+    for guid, ccList in pairs(recentCCs) do
+        for i = #ccList, 1, -1 do
+            if currentTime - ccList[i].time > CC_CHAIN_WINDOW then
+                table.remove(ccList, i)
+            end
+        end
+        if #ccList == 0 then
+            recentCCs[guid] = nil
+        end
+    end
+end
+
+-- Function to reset CC tracking (called when match starts/ends)
+function addon:ResetCCTracking()
+    recentCCs = {}
 end
 
 function addon:ProcessCombatLog()
@@ -82,8 +121,77 @@ function addon:ProcessCombatLog()
         if spellInfo then
             local eventType = "UNKNOWN"
 
-            if spellInfo.type == "STUN" or spellInfo.type == "SILENCE" or spellInfo.type == "INCAP" then
+            if spellInfo.type == "STUN" or spellInfo.type == "SILENCE" or spellInfo.type == "INCAP" or spellInfo.type == "DISORIENT" or spellInfo.type == "ROOT" then
                 eventType = "CC"
+                
+                -- CC Chain Detection
+                if subevent == "SPELL_AURA_APPLIED" then
+                    CleanOldCCs(timestamp)
+                    
+                    -- Initialize CC list for this target if needed
+                    if not recentCCs[destGUID] then
+                        recentCCs[destGUID] = {}
+                    end
+                    
+                    -- Check if this is part of a chain
+                    local isChain = #recentCCs[destGUID] > 0
+                    local chainSequence = {}
+                    
+                    -- Build chain sequence
+                    for _, ccData in ipairs(recentCCs[destGUID]) do
+                        table.insert(chainSequence, {
+                            spellId = ccData.spellId,
+                            spellName = ccData.spellName,
+                            source = ccData.sourceName,
+                            time = ccData.time
+                        })
+                    end
+                    
+                    -- Add current CC to sequence
+                    table.insert(chainSequence, {
+                        spellId = spellId,
+                        spellName = spellName,
+                        source = sourceName,
+                        time = timestamp
+                    })
+                    
+                    -- Store current CC
+                    table.insert(recentCCs[destGUID], {
+                        time = timestamp,
+                        spellId = spellId,
+                        spellName = spellName,
+                        sourceName = sourceName
+                    })
+                    
+                    -- If this is a chain, log it
+                    if isChain then
+                        -- Increment chain count for source
+                        addon.CurrentMatch.stats.ccChains[sourceGUID] = (addon.CurrentMatch.stats.ccChains[sourceGUID] or 0) + 1
+                        
+                        -- Log CC chain event
+                        table.insert(addon.CurrentMatch.events, {
+                            type = "CC_CHAIN",
+                            time = timestamp,
+                            target = destName,
+                            targetGUID = destGUID,
+                            chainSequence = chainSequence,
+                            chainLength = #chainSequence
+                        })
+                    end
+                elseif subevent == "SPELL_AURA_REMOVED" then
+                    -- Remove CC from tracking when it's removed
+                    if recentCCs[destGUID] then
+                        for i = #recentCCs[destGUID], 1, -1 do
+                            if recentCCs[destGUID][i].spellId == spellId then
+                                table.remove(recentCCs[destGUID], i)
+                                break
+                            end
+                        end
+                        if #recentCCs[destGUID] == 0 then
+                            recentCCs[destGUID] = nil
+                        end
+                    end
+                end
             elseif spellInfo.type == "DEFENSIVE" then
                 eventType = "DEFENSIVE"
             elseif spellInfo.type == "BURST" then
@@ -98,6 +206,66 @@ function addon:ProcessCombatLog()
                 time = timestamp,
                 source = sourceName,
                 dest = destName,
+                spellId = spellId,
+                spellName = spellName
+            })
+        end
+
+        -- 7. TRACK TRINKET USAGE
+    elseif subevent == "SPELL_CAST_SUCCESS" then
+        local spellId = arg12
+        local spellName = arg13
+        
+        -- Check if this is a trinket
+        if addon.IsTrinketSpell(spellId) then
+            CleanOldCCs(timestamp)
+            
+            -- Check if player had active CC when trinket was used
+            local hadCC, ccData = HasActiveCC(sourceGUID, timestamp)
+            
+            -- Increment trinket usage count
+            addon.CurrentMatch.stats.trinketUsage[sourceGUID] = (addon.CurrentMatch.stats.trinketUsage[sourceGUID] or 0) + 1
+            
+            -- Log trinket usage event
+            table.insert(addon.CurrentMatch.events, {
+                type = "TRINKET",
+                time = timestamp,
+                source = sourceName,
+                sourceGUID = sourceGUID,
+                spellId = spellId,
+                spellName = spellName,
+                brokeCC = hadCC,
+                brokenCC = hadCC and ccData or nil
+            })
+        end
+        
+        -- 8. TRACK BIG BUTTON ABILITIES (Cooldowns & Racials)
+        local isBigButton, buttonCategory = addon.IsBigButtonSpell(spellId)
+        if isBigButton then
+            -- Increment big button usage count
+            addon.CurrentMatch.stats.bigButtonUsage[sourceGUID] = (addon.CurrentMatch.stats.bigButtonUsage[sourceGUID] or 0) + 1
+            
+            -- Determine subtype
+            local subType = buttonCategory
+            local spellInfo = addon.IsImportantSpell(spellId)
+            if spellInfo then
+                if spellInfo.type == "BURST" then
+                    subType = "OFFENSIVE"
+                elseif spellInfo.type == "DEFENSIVE" then
+                    subType = "DEFENSIVE"
+                end
+            elseif addon.IsRacialAbility(spellId) then
+                local racial = addon.Constants.RacialAbilities[spellId]
+                subType = racial.category
+            end
+            
+            -- Log big button event
+            table.insert(addon.CurrentMatch.events, {
+                type = "BIG_BUTTON",
+                subType = subType, -- OFFENSIVE, DEFENSIVE, or RACIAL
+                time = timestamp,
+                source = sourceName,
+                sourceGUID = sourceGUID,
                 spellId = spellId,
                 spellName = spellName
             })

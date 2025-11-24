@@ -5,4 +5,6 @@
 ## Version: 2.0
 ## SavedVariables: PvPAnalyticsDB
 
+Constants.lua
 PvPAnalytics.lua
+CombatLog.lua
