@@ -1,5 +1,12 @@
 local _, addon = ...
-addon.Constants = {}
+-- Create global PvPAnalytics table - this file loads first
+PvPAnalytics = PvPAnalytics or {}
+local addon = PvPAnalytics
+
+-- Initialize Constants
+if not addon.Constants then
+    addon.Constants = {}
+end
 
 addon.Constants.CCTypes = {
     STUN = "STUN",
