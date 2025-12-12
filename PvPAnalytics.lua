@@ -12,6 +12,9 @@ function Frame:OnLoad()
     Frame:RegisterEvent("PLAYER_LOGIN")
     Frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
     Frame:RegisterEvent("ARENA_PREP_OPPONENT_SPECIALIZATIONS")
+    Frame:RegisterEvent("ARENA_OPPONENT_UPDATE")
+    Frame:RegisterEvent("ARENA_MATCH_START")
+    Frame:RegisterEvent("PVP_MATCH_COMPLETE")
     Frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 
     print("|cff00ff00[PvPAnalytics]|r Loaded. Waiting for Arena...")
@@ -68,6 +71,14 @@ function Frame:OnEvent(event, ...)
         
         -- Initialize addon after login
         PvPAnalytics:Initialize()
+    elseif event == "ARENA_PREP_OPPONENT_SPECIALIZATIONS" then
+        PvPAnalytics:CacheOpponentSpecs()
+    elseif event == "ARENA_OPPONENT_UPDATE" then
+        PvPAnalytics:UpdateArenaOpponent(...)
+    elseif event == "ARENA_MATCH_START" or event == "PVP_MATCH_START" then
+        PvPAnalytics:StartMatch()
+    elseif event == "PVP_MATCH_COMPLETE" then
+        PvPAnalytics:EndMatch()
     elseif event == "ZONE_CHANGED_NEW_AREA" then
         PvPAnalytics:CheckZone()
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" and PvPAnalytics.IsRecording then
@@ -82,22 +93,21 @@ end
 
 function PvPAnalytics:CheckZone()
     local _, instanceType = IsInInstance()
-    if instanceType == "arena" or instanceType == "pvp" then
-        if not PvPAnalytics.IsRecording then
-            PvPAnalytics:StartMatch()
-        end
-    else
+    if instanceType ~= "arena" and instanceType ~= "pvp" then
         if PvPAnalytics.IsRecording then
             PvPAnalytics:EndMatch()
         end
+        PvPAnalytics.CurrentMatch = nil
     end
 end
 
 function PvPAnalytics:StartMatch()
+    if PvPAnalytics.IsRecording then return end
     PvPAnalytics.IsRecording = true
+    PvPAnalytics.GuidToRealm = {}
     local mapName = GetZoneText()
     local timestamp = date("%Y-%m-%d %H:%M:%S")
-    local _, instanceType, difficulty = IsInInstance()
+    local _, _, difficulty = GetInstanceInfo()
     local arenaMode = "unknown"  -- Detect 2v2/3v3 like ArenaAnalytics
     
     -- Detect arena mode (inspired by Details! group detection)
@@ -110,12 +120,12 @@ function PvPAnalytics:StartMatch()
         end
     end
     
-    if groupSize == 2 then 
+    if difficulty == 10 or difficulty == 8 or difficulty == 7 then
+        arenaMode = "Solo Shuffle"
+    elseif groupSize == 2 then 
         arenaMode = "2v2"
     elseif groupSize == 3 then 
         arenaMode = "3v3"
-    elseif difficulty == 7 then 
-        arenaMode = "Solo Shuffle"  -- Rated Solo Shuffle
     end
     
     -- Get your team info (enhanced player tracking)
@@ -123,6 +133,7 @@ function PvPAnalytics:StartMatch()
     local playerGUID = UnitGUID("player")
     if playerGUID then
         local name = UnitName("player")
+        local realm = GetRealmName()
         local class, classId = UnitClass("player")
         local specId = GetSpecializationInfo(GetSpecialization() or 1)
         local faction = UnitFactionGroup("player")
@@ -131,6 +142,7 @@ function PvPAnalytics:StartMatch()
         if not PvPAnalyticsDB.players[playerGUID] then
             PvPAnalyticsDB.players[playerGUID] = {
                 name = name,
+                realm = realm,
                 class = class,
                 classId = classId,
                 specId = specId,
@@ -153,7 +165,7 @@ function PvPAnalytics:StartMatch()
         if UnitExists(unit) then
             local guid = UnitGUID(unit)
             if guid then
-                local name = UnitName(unit)
+                local name, realm = UnitName(unit)
                 local class, classId = UnitClass(unit)
                 local specId = GetSpecializationInfo(GetSpecialization() or 1, nil, UnitSex(unit))
                 local faction = UnitFactionGroup(unit)
@@ -162,6 +174,7 @@ function PvPAnalytics:StartMatch()
                 if not PvPAnalyticsDB.players[guid] then
                     PvPAnalyticsDB.players[guid] = {
                         name = name,
+                        realm = realm,
                         class = class,
                         classId = classId,
                         specId = specId,
@@ -216,6 +229,7 @@ function PvPAnalytics:StartMatch()
             class = select(2, UnitClass("player")),
             spec = GetSpecializationInfo(GetSpecialization() or 1),
             faction = UnitFactionGroup("player"),
+            realm = GetRealmName(),
             isAlly = true,
             damageShare = 0,
             ccUptime = 0
@@ -232,6 +246,7 @@ function PvPAnalytics:StartMatch()
                     class = select(2, UnitClass(unit)),
                     spec = GetSpecializationInfo(GetSpecialization() or 1, nil, UnitSex(unit)),
                     faction = UnitFactionGroup(unit),
+                    realm = select(2, UnitName(unit)),
                     isAlly = true,
                     damageShare = 0,
                     ccUptime = 0
@@ -245,10 +260,233 @@ function PvPAnalytics:StartMatch()
         PvPAnalytics:ResetCCTracking()
     end
     
+    PvPAnalytics:CacheOpponentSpecs()
     print("|cff00ff00[PvPAnalytics]|r Match Started: " .. mapName .. " (" .. arenaMode .. ")")
 end
 
+-- Opponent prep data (class/spec/realm) before the match starts
+function PvPAnalytics:CacheOpponentSpecs()
+    if not PvPAnalytics.CurrentMatch then return end
+    local match = PvPAnalytics.CurrentMatch
+    for i = 1, GetNumArenaOpponentSpecs() do
+        local specId = GetArenaOpponentSpec(i)
+        if specId and specId > 0 then
+            local _, specName, _, _, _, classFile = GetSpecializationInfoByID(specId)
+            local unit = "arena" .. i
+            local name, realm = UnitName(unit)
+            local guid = UnitGUID(unit)
+            if name then
+                realm = realm and realm ~= "" and realm or GetRealmName()
+                local entry = {
+                    name = name,
+                    class = classFile,
+                    spec = specName or specId,
+                    faction = "opponent",
+                    isAlly = false,
+                    damageShare = 0,
+                    ccUptime = 0,
+                    realm = realm
+                }
+                if guid then
+                    PvPAnalytics.GuidToRealm[guid] = realm
+                    match.opponents[guid] = entry
+                else
+                    -- Store by slot name if GUID not yet available
+                    match.opponents[name] = entry
+                end
+            end
+        end
+    end
+end
+
+-- Update opponent data when units become visible
+function PvPAnalytics:UpdateArenaOpponent(unitId, updateReason)
+    if not PvPAnalytics.CurrentMatch or not unitId then return end
+    local guid = UnitGUID(unitId)
+    local name, realm = UnitName(unitId)
+    if not guid or not name then return end
+    realm = realm and realm ~= "" and realm or GetRealmName()
+    PvPAnalytics.GuidToRealm[guid] = realm
+    local classFile = select(2, UnitClass(unitId))
+    local index = tonumber(string.match(unitId, "arena(%d+)") or "")
+    local specId
+    if index then
+        local id = GetArenaOpponentSpec(index)
+        if id and id > 0 then
+            specId = select(1, GetSpecializationInfoByID(id))
+        end
+    end
+    local match = PvPAnalytics.CurrentMatch
+    match.opponents[guid] = match.opponents[guid] or {
+        damageShare = 0,
+        ccUptime = 0
+    }
+    match.opponents[guid].name = name
+    match.opponents[guid].class = classFile
+    match.opponents[guid].spec = specId
+    match.opponents[guid].faction = "opponent"
+    match.opponents[guid].isAlly = false
+    match.opponents[guid].realm = realm
+end
+
+local function AddAmount(tbl, guid, amount)
+    if not guid or not amount then return end
+    tbl[guid] = (tbl[guid] or 0) + amount
+end
+
+local function GetBaseName(name)
+    if not name then return nil end
+    local short = strsplit("-", name)
+    return short or name
+end
+
+function PvPAnalytics:EnsureActor(guid, name, isAlly)
+    if not guid or not PvPAnalytics.CurrentMatch then return end
+    local match = PvPAnalytics.CurrentMatch
+    local faction = isAlly and UnitFactionGroup("player") or "opponent"
+    local targetTable = isAlly and match.players or match.opponents
+    if not targetTable[guid] then
+        targetTable[guid] = {
+            name = GetBaseName(name) or "Unknown",
+            class = nil,
+            spec = nil,
+            faction = faction,
+            isAlly = isAlly,
+            damageShare = 0,
+            ccUptime = 0,
+            realm = PvPAnalytics.GuidToRealm[guid]
+        }
+    end
+end
+
+function PvPAnalytics:IsAlly(flags)
+    return bit.band(flags or 0, COMBATLOG_OBJECT_REACTION_FRIENDLY) > 0
+end
+
+function PvPAnalytics:ProcessCombatLog()
+    if not PvPAnalytics.CurrentMatch then return end
+    local match = PvPAnalytics.CurrentMatch
+    local info = { CombatLogGetCurrentEventInfo() }
+    local timestamp, subevent, _, sourceGUID, sourceName, sourceFlags, _, destGUID, destName, destFlags = unpack(info)
+    local eventTime = date("%H:%M:%S")
+
+    local isAllySource = PvPAnalytics:IsAlly(sourceFlags)
+    local isAllyDest = PvPAnalytics:IsAlly(destFlags)
+
+    if sourceGUID then
+        PvPAnalytics:EnsureActor(sourceGUID, sourceName, isAllySource)
+    end
+    if destGUID then
+        PvPAnalytics:EnsureActor(destGUID, destName, isAllyDest)
+    end
+
+    -- Record timeline event with timestamp
+    table.insert(match.events, {
+        type = subevent,
+        time = eventTime,
+        rawTime = timestamp,
+        sourceGUID = sourceGUID,
+        sourceName = sourceName,
+        destGUID = destGUID,
+        destName = destName
+    })
+
+    -- Damage events
+    if subevent == "SWING_DAMAGE" then
+        local amount = info[12]
+        AddAmount(match.stats.damage, sourceGUID, amount)
+    elseif subevent == "RANGE_DAMAGE" or subevent == "SPELL_DAMAGE" or subevent == "SPELL_PERIODIC_DAMAGE" or subevent == "DAMAGE_SPLIT" or subevent == "DAMAGE_SHIELD" or subevent == "SPELL_BUILDING_DAMAGE" then
+        local amount = info[15]
+        AddAmount(match.stats.damage, sourceGUID, amount)
+    elseif subevent == "ENVIRONMENTAL_DAMAGE" then
+        local amount = info[13]
+        AddAmount(match.stats.damage, sourceGUID, amount)
+    end
+
+    -- Healing
+    if subevent == "SPELL_HEAL" or subevent == "SPELL_PERIODIC_HEAL" then
+        local amount = info[15]
+        AddAmount(match.stats.healing, sourceGUID, amount)
+    end
+
+    -- Absorbs (logged as healing/absorbed)
+    if subevent == "SPELL_ABSORBED" then
+        local absorbAmount = info[#info]  -- last param is amount
+        AddAmount(match.stats.absorbs, destGUID or sourceGUID, absorbAmount)
+    end
+
+    -- Interrupts
+    if subevent == "SPELL_INTERRUPT" then
+        AddAmount(match.stats.interrupts, sourceGUID, 1)
+    end
+
+    -- Deaths
+    if subevent == "UNIT_DIED" or subevent == "PARTY_KILL" then
+        table.insert(match.events, {
+            type = "DEATH",
+            time = eventTime,
+            rawTime = timestamp,
+            sourceGUID = sourceGUID,
+            sourceName = sourceName,
+            destGUID = destGUID,
+            destName = destName
+        })
+        AddAmount(match.stats.deaths, destGUID, 1)
+    end
+end
+
+-- Pull final damage/heal from scoreboard to ensure completeness
+function PvPAnalytics:PopulateScoreboardStats(match)
+    if not match then return end
+    local numScores = GetNumBattlefieldScores and GetNumBattlefieldScores() or 0
+    for i = 1, numScores do
+        local name, killingBlows, honorableKills, deaths, honor, faction, race, class, classFileName, damageDone, healingDone = GetBattlefieldScore(i)
+        local guid = PvPAnalytics:FindGuidByName(name, match)
+        if guid then
+            if damageDone and damageDone > 0 then
+                match.stats.damage[guid] = damageDone
+            end
+            if healingDone and healingDone > 0 then
+                match.stats.healing[guid] = healingDone
+            end
+        end
+    end
+    if C_PvP and C_PvP.GetScoreInfo then
+        for i = 1, numScores do
+            local scoreInfo = C_PvP.GetScoreInfo(i)
+            if scoreInfo and scoreInfo.name then
+                local guid = PvPAnalytics:FindGuidByName(scoreInfo.name, match)
+                if guid then
+                    if scoreInfo.damageDone and scoreInfo.damageDone > 0 then
+                        match.stats.damage[guid] = scoreInfo.damageDone
+                    end
+                    if scoreInfo.healingDone and scoreInfo.healingDone > 0 then
+                        match.stats.healing[guid] = scoreInfo.healingDone
+                    end
+                end
+            end
+        end
+    end
+end
+
+function PvPAnalytics:FindGuidByName(name, match)
+    if not name or not match then return nil end
+    local short = GetBaseName(name)
+    for guid, data in pairs(match.players) do
+        if GetBaseName(data.name) == short then
+            return guid
+        end
+    end
+    for guid, data in pairs(match.opponents) do
+        if GetBaseName(data.name) == short then
+            return guid
+        end
+    end
+    return nil
+end
+
 function PvPAnalytics:EndMatch()
+    if not PvPAnalytics.IsRecording then return end
     PvPAnalytics.IsRecording = false
     if PvPAnalytics.CurrentMatch then
         local match = PvPAnalytics.CurrentMatch
@@ -256,6 +494,7 @@ function PvPAnalytics:EndMatch()
         match.metadata.endTime = endTime
         local startTime = match.metadata.id
         match.metadata.duration = math.floor(GetTime() - startTime)  -- Duration in seconds
+        PvPAnalytics:PopulateScoreboardStats(match)
         
         -- Determine winner (simple: if more opponent deaths than ally deaths)
         local allyDeaths = 0
@@ -276,7 +515,19 @@ function PvPAnalytics:EndMatch()
             end
         end
         
-        local youWon = opponentDeaths > allyDeaths or opponentDeaths >= match.metadata.yourTeamSize
+        local youWon
+        local battlefieldWinner = GetBattlefieldWinner and GetBattlefieldWinner()
+        if battlefieldWinner ~= nil then
+            local faction = UnitFactionGroup("player")
+            if faction == "Alliance" then
+                youWon = battlefieldWinner == 0
+            elseif faction == "Horde" then
+                youWon = battlefieldWinner == 1
+            end
+        end
+        if youWon == nil then
+            youWon = opponentDeaths > allyDeaths or opponentDeaths >= match.metadata.yourTeamSize
+        end
         match.metadata.winner = youWon and "your_team" or "opponents"
         
         -- Update user profile (DBContext)
