@@ -10,10 +10,12 @@ PvPAnalytics.IsRecording = false
 
 function Frame:OnLoad()
     Frame:RegisterEvent("PLAYER_LOGIN")
+    Frame:RegisterEvent("PLAYER_ENTERING_WORLD")
     Frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
     Frame:RegisterEvent("ARENA_PREP_OPPONENT_SPECIALIZATIONS")
     Frame:RegisterEvent("ARENA_OPPONENT_UPDATE")
     Frame:RegisterEvent("ARENA_MATCH_START")
+    Frame:RegisterEvent("ARENA_MATCH_END")
     Frame:RegisterEvent("PVP_MATCH_COMPLETE")
     Frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 
@@ -71,13 +73,15 @@ function Frame:OnEvent(event, ...)
         
         -- Initialize addon after login
         PvPAnalytics:Initialize()
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        PvPAnalytics:CheckZone()
     elseif event == "ARENA_PREP_OPPONENT_SPECIALIZATIONS" then
         PvPAnalytics:CacheOpponentSpecs()
     elseif event == "ARENA_OPPONENT_UPDATE" then
         PvPAnalytics:UpdateArenaOpponent(...)
     elseif event == "ARENA_MATCH_START" or event == "PVP_MATCH_START" then
         PvPAnalytics:StartMatch()
-    elseif event == "PVP_MATCH_COMPLETE" then
+    elseif event == "PVP_MATCH_COMPLETE" or event == "ARENA_MATCH_END" then
         PvPAnalytics:EndMatch()
     elseif event == "ZONE_CHANGED_NEW_AREA" then
         PvPAnalytics:CheckZone()
@@ -98,6 +102,11 @@ function PvPAnalytics:CheckZone()
             PvPAnalytics:EndMatch()
         end
         PvPAnalytics.CurrentMatch = nil
+        return
+    end
+    -- In arena and not recording yet: start once gates open event fires; if missed, start now
+    if instanceType == "arena" and not PvPAnalytics.IsRecording then
+        PvPAnalytics:StartMatch()
     end
 end
 
