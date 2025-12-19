@@ -7,6 +7,7 @@ local Frame = CreateFrame("Frame")
 -- Current Match State
 PvPAnalytics.CurrentMatch = nil
 PvPAnalytics.IsRecording = false
+PvPAnalytics.DebugMode = true -- temporary debug prints for troubleshooting
 
 function Frame:OnLoad()
     Frame:RegisterEvent("PLAYER_LOGIN")
@@ -212,7 +213,11 @@ function PvPAnalytics:StartMatch()
             mode = arenaMode,
             duration = 0,
             winner = nil,  -- Will be set on end (your team wins if opponents die first)
-            yourTeamSize = groupSize
+            yourTeamSize = groupSize,
+            isRated = false,
+            ratingChange = nil,
+            personalRating = nil,
+            mmr = nil
         },
         players = {}, -- Enhanced: {guid = {name, class, spec, faction, isAlly = true/false, damageShare, ccUptime}}
         opponents = {},  -- New: Separate opponent tracking like ArenaAnalytics
@@ -270,6 +275,9 @@ function PvPAnalytics:StartMatch()
     end
     
     PvPAnalytics:CacheOpponentSpecs()
+    if PvPAnalytics.DebugMode then
+        print("|cff00ff00[PvPAnalytics]|r Debug: StartMatch fired (" .. mapName .. ", " .. arenaMode .. ", diff " .. tostring(difficulty) .. ")")
+    end
     print("|cff00ff00[PvPAnalytics]|r Match Started: " .. mapName .. " (" .. arenaMode .. ")")
 end
 
@@ -336,6 +344,15 @@ function PvPAnalytics:UpdateArenaOpponent(unitId, updateReason)
     match.opponents[guid].faction = "opponent"
     match.opponents[guid].isAlly = false
     match.opponents[guid].realm = realm
+end
+
+local function IsRatedFromScore(scoreInfo)
+    if not scoreInfo then return false end
+    return scoreInfo.ratingChange ~= nil
+        or scoreInfo.personalRating ~= nil
+        or scoreInfo.mmr ~= nil
+        or scoreInfo.mmrChange ~= nil
+        or scoreInfo.rating ~= nil
 end
 
 local function AddAmount(tbl, guid, amount)
@@ -447,6 +464,13 @@ end
 -- Pull final damage/heal from scoreboard to ensure completeness
 function PvPAnalytics:PopulateScoreboardStats(match)
     if not match then return end
+    if RequestBattlefieldScoreData then
+        RequestBattlefieldScoreData()
+    end
+    local playerName = UnitName("player")
+    local playerShort = GetBaseName(playerName)
+    local ratedDetected = false
+    local selfRatingChange, selfRating, selfMMR
     local numScores = GetNumBattlefieldScores and GetNumBattlefieldScores() or 0
     for i = 1, numScores do
         local name, killingBlows, honorableKills, deaths, honor, faction, race, class, classFileName, damageDone, healingDone = GetBattlefieldScore(i)
@@ -459,22 +483,54 @@ function PvPAnalytics:PopulateScoreboardStats(match)
                 match.stats.healing[guid] = healingDone
             end
         end
-    end
-    if C_PvP and C_PvP.GetScoreInfo then
-        for i = 1, numScores do
+        if C_PvP and C_PvP.GetScoreInfo then
             local scoreInfo = C_PvP.GetScoreInfo(i)
             if scoreInfo and scoreInfo.name then
-                local guid = PvPAnalytics:FindGuidByName(scoreInfo.name, match)
-                if guid then
+                if IsRatedFromScore(scoreInfo) then
+                    ratedDetected = true
+                end
+                if GetBaseName(scoreInfo.name) == playerShort then
+                    selfRatingChange = scoreInfo.ratingChange or scoreInfo.personalRatingChange or scoreInfo.mmrChange
+                    selfRating = scoreInfo.rating or scoreInfo.personalRating or scoreInfo.prematchMMR or scoreInfo.mmr
+                    selfMMR = scoreInfo.mmr or scoreInfo.prematchMMR
+                end
+                local guidScore = PvPAnalytics:FindGuidByName(scoreInfo.name, match)
+                if guidScore then
                     if scoreInfo.damageDone and scoreInfo.damageDone > 0 then
-                        match.stats.damage[guid] = scoreInfo.damageDone
+                        match.stats.damage[guidScore] = scoreInfo.damageDone
                     end
                     if scoreInfo.healingDone and scoreInfo.healingDone > 0 then
-                        match.stats.healing[guid] = scoreInfo.healingDone
+                        match.stats.healing[guidScore] = scoreInfo.healingDone
                     end
                 end
             end
         end
+    end
+    match.metadata.isRated = ratedDetected
+    match.metadata.ratingChange = selfRatingChange
+    match.metadata.personalRating = selfRating
+    match.metadata.mmr = selfMMR
+    local function EnsureStat(tbl, guid)
+        if guid and tbl[guid] == nil then
+            tbl[guid] = 0
+        end
+    end
+    for guid in pairs(match.players) do
+        EnsureStat(match.stats.damage, guid)
+        EnsureStat(match.stats.healing, guid)
+        EnsureStat(match.stats.absorbs, guid)
+        EnsureStat(match.stats.interrupts, guid)
+        EnsureStat(match.stats.deaths, guid)
+    end
+    for guid in pairs(match.opponents) do
+        EnsureStat(match.stats.damage, guid)
+        EnsureStat(match.stats.healing, guid)
+        EnsureStat(match.stats.absorbs, guid)
+        EnsureStat(match.stats.interrupts, guid)
+        EnsureStat(match.stats.deaths, guid)
+    end
+    if PvPAnalytics.DebugMode then
+        print("|cff00ff00[PvPAnalytics]|r Debug: Scoreboard populated (rated=" .. tostring(match.metadata.isRated) .. ", selfRating=" .. tostring(selfRating) .. ", change=" .. tostring(selfRatingChange) .. ")")
     end
 end
 
@@ -524,15 +580,26 @@ function PvPAnalytics:EndMatch()
             end
         end
         
-        local youWon
-        local battlefieldWinner = GetBattlefieldWinner and GetBattlefieldWinner()
-        if battlefieldWinner ~= nil then
+        local function WinnerFromBattlefield()
+            local winner = GetBattlefieldWinner and GetBattlefieldWinner()
+            if winner == nil then return nil end
             local faction = UnitFactionGroup("player")
             if faction == "Alliance" then
-                youWon = battlefieldWinner == 0
+                return winner == 1 or winner == "Alliance"
             elseif faction == "Horde" then
-                youWon = battlefieldWinner == 1
+                return winner == 0 or winner == "Horde"
             end
+            return nil
+        end
+        local youWon
+        if C_PvP and C_PvP.GetMatchOutcome then
+            local outcome = C_PvP.GetMatchOutcome()
+            if outcome ~= nil then
+                if outcome == 0 then youWon = true elseif outcome == 1 then youWon = false end
+            end
+        end
+        if youWon == nil then
+            youWon = WinnerFromBattlefield()
         end
         if youWon == nil then
             youWon = opponentDeaths > allyDeaths or opponentDeaths >= match.metadata.yourTeamSize
@@ -638,9 +705,19 @@ function PvPAnalytics:EndMatch()
         table.insert(PvPAnalyticsDB.matches, match)
         
         local winLossText = youWon and "WIN" or "LOSS"
-        local ratingText = math.floor(match.stats.matchRating)
+        local ratingText = ""
+        if match.metadata.isRated then
+            local base = match.metadata.personalRating or 0
+            local change = match.metadata.ratingChange or 0
+            ratingText = " | Rating: " .. math.floor(base) .. " (" .. (change >= 0 and "+" or "") .. math.floor(change) .. ")"
+        else
+            ratingText = " | Skirmish"
+        end
         local durationText = math.floor(match.metadata.duration)
-        print("|cff00ff00[PvPAnalytics]|r Match Ended: " .. winLossText .. " | Rating: " .. ratingText .. " | Duration: " .. durationText .. "s")
+        if PvPAnalytics.DebugMode then
+            print("|cff00ff00[PvPAnalytics]|r Debug: EndMatch fired (winner=" .. tostring(match.metadata.winner) .. ", rated=" .. tostring(match.metadata.isRated) .. ")")
+        end
+        print("|cff00ff00[PvPAnalytics]|r Match Ended: " .. winLossText .. ratingText .. " | Duration: " .. durationText .. "s")
         PvPAnalytics.CurrentMatch = nil
     end
     
