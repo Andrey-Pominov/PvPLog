@@ -95,6 +95,23 @@ function addon:ProcessCombatLog()
         if not subevent or type(subevent) ~= "string" then
             return
         end
+
+        -- Store raw combat log event for full replay
+        if addon.CurrentMatch and addon.CurrentMatch.rawEvents then
+            local rawEvent = {
+                ts = timestamp,
+                event = subevent,
+                sourceGUID = sourceGUID,
+                sourceName = sourceName,
+                destGUID = destGUID,
+                destName = destName,
+                spellId = arg12,
+                spellName = arg13,
+                amount = arg15,
+                extra = arg16,
+            }
+            table.insert(addon.CurrentMatch.rawEvents, rawEvent)
+        end
         
         -- Initialize players involved
         if sourceName then InitPlayer(sourceGUID, sourceName) end

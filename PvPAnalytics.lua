@@ -81,7 +81,11 @@ function Frame:OnEvent(event, ...)
     elseif event == "ARENA_OPPONENT_UPDATE" then
         PvPAnalytics:UpdateArenaOpponent(...)
     elseif event == "ARENA_MATCH_START" or event == "PVP_MATCH_START" then
-        PvPAnalytics:StartMatch()
+        if PvPAnalytics.CurrentMatch then
+            PvPAnalytics:RefreshInstanceMetadata()
+        else
+            PvPAnalytics:StartMatch()
+        end
     elseif event == "PVP_MATCH_COMPLETE" or event == "ARENA_MATCH_END" then
         PvPAnalytics:EndMatch()
     elseif event == "ZONE_CHANGED_NEW_AREA" then
@@ -115,27 +119,33 @@ function PvPAnalytics:StartMatch()
     if PvPAnalytics.IsRecording then return end
     PvPAnalytics.IsRecording = true
     PvPAnalytics.GuidToRealm = {}
-    local mapName = GetZoneText()
+    local instanceName, instanceType, difficultyID, _, maxPlayers = GetInstanceInfo()
+    local mapName = instanceName or GetZoneText()
     local timestamp = date("%Y-%m-%d %H:%M:%S")
-    local _, _, difficulty = GetInstanceInfo()
-    local arenaMode = "unknown"  -- Detect 2v2/3v3 like ArenaAnalytics
-    
-    -- Detect arena mode (inspired by Details! group detection)
-    local groupSize = 1
-    if IsInGroup() then
-        if IsInRaid() then
-            groupSize = GetNumGroupMembers()
-        else
-            groupSize = GetNumGroupMembers() + 1  -- +1 for player
-        end
-    end
-    
-    if difficulty == 10 or difficulty == 8 or difficulty == 7 then
+    local arenaMode = "unknown"  -- Detect 2v2/3v3/SoloShuffle from live instance
+
+    -- Detect arena mode using instance data (more reliable than queue location)
+    if difficultyID == 10 or difficultyID == 8 or difficultyID == 7 or difficultyID == 241 then
         arenaMode = "Solo Shuffle"
-    elseif groupSize == 2 then 
+    elseif maxPlayers == 2 then
         arenaMode = "2v2"
-    elseif groupSize == 3 then 
+    elseif maxPlayers == 3 then
         arenaMode = "3v3"
+    else
+        -- Fallback to group size if instance data is inconclusive
+        local groupSize = 1
+        if IsInGroup() then
+            if IsInRaid() then
+                groupSize = GetNumGroupMembers()
+            else
+                groupSize = GetNumGroupMembers() + 1
+            end
+        end
+        if groupSize == 2 then
+            arenaMode = "2v2"
+        elseif groupSize == 3 then
+            arenaMode = "3v3"
+        end
     end
     
     -- Get your team info (enhanced player tracking)
@@ -220,7 +230,8 @@ function PvPAnalytics:StartMatch()
         },
         players = {}, -- Enhanced: {guid = {name, class, spec, faction, isAlly = true/false, damageShare, ccUptime}}
         opponents = {},  -- New: Separate opponent tracking like ArenaAnalytics
-        events = {},  -- Existing timeline
+        events = {},  -- High-level timeline
+        rawEvents = {}, -- Full combat log stream for this match
         stats = {
             damage = {},
             healing = {},
@@ -377,6 +388,39 @@ function PvPAnalytics:EnsureActor(guid, name, isAlly)
             realm = PvPAnalytics.GuidToRealm[guid]
         }
     end
+end
+
+-- Refresh metadata (map, mode, team size) from the live instance; call when gates open
+function PvPAnalytics:RefreshInstanceMetadata()
+    if not PvPAnalytics.CurrentMatch then return end
+    local match = PvPAnalytics.CurrentMatch
+    local instanceName, _, difficultyID, _, maxPlayers = GetInstanceInfo()
+    if instanceName then
+        match.metadata.map = instanceName
+    end
+
+    local arenaMode = match.metadata.mode or "unknown"
+    if difficultyID == 10 or difficultyID == 8 or difficultyID == 7 or difficultyID == 241 then
+        arenaMode = "Solo Shuffle"
+    elseif maxPlayers == 2 then
+        arenaMode = "2v2"
+    elseif maxPlayers == 3 then
+        arenaMode = "3v3"
+    end
+    match.metadata.mode = arenaMode
+
+    local teamSize = 1
+    if IsInGroup() then
+        if IsInRaid() then
+            teamSize = GetNumGroupMembers()
+        else
+            teamSize = GetNumGroupMembers() + 1
+        end
+    end
+    if maxPlayers and maxPlayers > 0 then
+        teamSize = math.min(teamSize, maxPlayers) -- clamp to instance size
+    end
+    match.metadata.yourTeamSize = teamSize
 end
 
 function PvPAnalytics:IsAlly(flags)
@@ -670,66 +714,8 @@ function PvPAnalytics:EndMatch()
     end
 end
 
--- New: JSON serialization helper (for web export, simple version)
-function PvPAnalytics:SerializeToJSON(data, depth)
-    depth = depth or 0
-    local indent = string.rep("  ", depth)
-    
-    if type(data) == "nil" then
-        return "null"
-    elseif type(data) == "boolean" then
-        return data and "true" or "false"
-    elseif type(data) == "number" then
-        return tostring(data)
-    elseif type(data) == "string" then
-        -- Escape special characters
-        local escaped = data:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
-        return '"' .. escaped .. '"'
-    elseif type(data) == "table" then
-        -- Check if it's an array (sequential numeric keys starting from 1)
-        local isArray = true
-        local maxIndex = 0
-        local count = 0
-        for k, v in pairs(data) do
-            count = count + 1
-            if type(k) ~= "number" or k < 1 or k ~= math.floor(k) then
-                isArray = false
-                break
-            end
-            if k > maxIndex then maxIndex = k end
-        end
-        if isArray and maxIndex == count then
-            -- Array format
-            local json = "["
-            local first = true
-            for i = 1, maxIndex do
-                if not first then json = json .. "," end
-                first = false
-                json = json .. "\n" .. indent .. "  " .. PvPAnalytics:SerializeToJSON(data[i], depth + 1)
-            end
-            json = json .. "\n" .. indent .. "]"
-            return json
-        else
-            -- Object format
-            local json = "{"
-            local first = true
-            for key, value in pairs(data) do
-                if not first then json = json .. "," end
-                first = false
-                local keyStr = type(key) == "string" and PvPAnalytics:SerializeToJSON(key, depth + 1) or '"' .. tostring(key) .. '"'
-                json = json .. "\n" .. indent .. "  " .. keyStr .. ": " .. PvPAnalytics:SerializeToJSON(value, depth + 1)
-            end
-            json = json .. "\n" .. indent .. "}"
-            return json
-        end
-    else
-        return '"' .. tostring(data) .. '"'
-    end
-end
-
 -- --- SLASH COMMANDS ---
 SLASH_PVPANALYTICS1 = "/pvpdata"
-SLASH_PVPANALYTICS2 = "/pvpexport"  -- New: Export command alias
 SlashCmdList["PVPANALYTICS"] = function(msg)
     msg = msg or ""
     -- Trim whitespace
@@ -771,41 +757,17 @@ SlashCmdList["PVPANALYTICS"] = function(msg)
         else
             print("|cffff0000[PvPAnalytics]|r Profile not initialized. Play a match first.")
         end
-    elseif args[1] and args[1]:lower() == "export" and args[2] then
-        -- New: Export specific match for web
-        local matchId = tonumber(args[2])
-        if matchId then
-            local found = false
-            for _, match in ipairs(PvPAnalyticsDB.matches) do
-                if math.floor(match.metadata.id) == math.floor(matchId) then
-                    -- Generate JSON (simple serialization for web)
-                    local json = PvPAnalytics:SerializeToJSON(match)
-                    print("|cff00ff00[PvPAnalytics]|r Export for Match " .. matchId .. ":")
-                    print("|cffffffff" .. json)
-                    print("|cff00ff00[PvPAnalytics]|r Copy the above JSON and upload to your website!")
-                    found = true
-                    break
-                end
-            end
-            if not found then
-                print("|cffff0000[PvPAnalytics]|r Match ID not found. Use /pvpdata to list matches.")
-            end
-        else
-            print("|cffff0000[PvPAnalytics]|r Usage: /pvpdata export <matchId>")
-            print("|cffff0000[PvPAnalytics]|r Example: /pvpdata export 1234567890")
-        end
     elseif msg == "" then
         local count = #PvPAnalyticsDB.matches
         local playerCount = 0
         for _ in pairs(PvPAnalyticsDB.players) do playerCount = playerCount + 1 end
         print("|cff00ff00[PvPAnalytics]|r Stored Matches: " .. count .. " | Players Tracked: " .. playerCount)
         if count > 0 then
-            print("|cff00ff00[PvPAnalytics]|r Commands: clear, profile, export <id>")
-            print("|cff00ff00[PvPAnalytics]|r Example: /pvpdata export " .. math.floor(PvPAnalyticsDB.matches[count].metadata.id))
+            print("|cff00ff00[PvPAnalytics]|r Commands: clear, profile")
         end
     else
         print("|cff00ff00[PvPAnalytics]|r Unknown command: " .. msg)
-        print("|cff00ff00[PvPAnalytics]|r Commands: clear, profile, export <id>")
+        print("|cff00ff00[PvPAnalytics]|r Commands: clear, profile")
     end
 end
 
