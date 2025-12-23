@@ -199,7 +199,6 @@ function PvPAnalytics:StartMatch()
                     }
                 end
                 teamPlayers[guid] = true
-                PvPAnalyticsDB.players[guid].matchesPlayed = (PvPAnalyticsDB.players[guid].matchesPlayed or 0) + 1
             end
         end
     end
@@ -355,11 +354,6 @@ local function IsRatedFromScore(scoreInfo)
         or scoreInfo.rating ~= nil
 end
 
-local function AddAmount(tbl, guid, amount)
-    if not guid or not amount then return end
-    tbl[guid] = (tbl[guid] or 0) + amount
-end
-
 local function GetBaseName(name)
     if not name then return nil end
     local short = strsplit("-", name)
@@ -390,75 +384,8 @@ function PvPAnalytics:IsAlly(flags)
 end
 
 function PvPAnalytics:ProcessCombatLog()
-    if not PvPAnalytics.CurrentMatch then return end
-    local match = PvPAnalytics.CurrentMatch
-    local info = { CombatLogGetCurrentEventInfo() }
-    local timestamp, subevent, _, sourceGUID, sourceName, sourceFlags, _, destGUID, destName, destFlags = unpack(info)
-    local eventTime = date("%H:%M:%S")
-
-    local isAllySource = PvPAnalytics:IsAlly(sourceFlags)
-    local isAllyDest = PvPAnalytics:IsAlly(destFlags)
-
-    if sourceGUID then
-        PvPAnalytics:EnsureActor(sourceGUID, sourceName, isAllySource)
-    end
-    if destGUID then
-        PvPAnalytics:EnsureActor(destGUID, destName, isAllyDest)
-    end
-
-    -- Record timeline event with timestamp
-    table.insert(match.events, {
-        type = subevent,
-        time = eventTime,
-        rawTime = timestamp,
-        sourceGUID = sourceGUID,
-        sourceName = sourceName,
-        destGUID = destGUID,
-        destName = destName
-    })
-
-    -- Damage events
-    if subevent == "SWING_DAMAGE" then
-        local amount = info[12]
-        AddAmount(match.stats.damage, sourceGUID, amount)
-    elseif subevent == "RANGE_DAMAGE" or subevent == "SPELL_DAMAGE" or subevent == "SPELL_PERIODIC_DAMAGE" or subevent == "DAMAGE_SPLIT" or subevent == "DAMAGE_SHIELD" or subevent == "SPELL_BUILDING_DAMAGE" then
-        local amount = info[15]
-        AddAmount(match.stats.damage, sourceGUID, amount)
-    elseif subevent == "ENVIRONMENTAL_DAMAGE" then
-        local amount = info[13]
-        AddAmount(match.stats.damage, sourceGUID, amount)
-    end
-
-    -- Healing
-    if subevent == "SPELL_HEAL" or subevent == "SPELL_PERIODIC_HEAL" then
-        local amount = info[15]
-        AddAmount(match.stats.healing, sourceGUID, amount)
-    end
-
-    -- Absorbs (logged as healing/absorbed)
-    if subevent == "SPELL_ABSORBED" then
-        local absorbAmount = info[#info]  -- last param is amount
-        AddAmount(match.stats.absorbs, destGUID or sourceGUID, absorbAmount)
-    end
-
-    -- Interrupts
-    if subevent == "SPELL_INTERRUPT" then
-        AddAmount(match.stats.interrupts, sourceGUID, 1)
-    end
-
-    -- Deaths
-    if subevent == "UNIT_DIED" or subevent == "PARTY_KILL" then
-        table.insert(match.events, {
-            type = "DEATH",
-            time = eventTime,
-            rawTime = timestamp,
-            sourceGUID = sourceGUID,
-            sourceName = sourceName,
-            destGUID = destGUID,
-            destName = destName
-        })
-        AddAmount(match.stats.deaths, destGUID, 1)
-    end
+    -- Implementation is provided by CombatLog.lua (richer combat log handling).
+    -- This stub remains so Frame:OnEvent can safely call :ProcessCombatLog().
 end
 
 -- Pull final damage/heal from scoreboard to ensure completeness
@@ -510,6 +437,13 @@ function PvPAnalytics:PopulateScoreboardStats(match)
     match.metadata.ratingChange = selfRatingChange
     match.metadata.personalRating = selfRating
     match.metadata.mmr = selfMMR
+
+    -- Use Blizzard rating/MMR for matchRating when available; 0 for unrated/skirmish
+    if selfRating or selfMMR then
+        match.stats.matchRating = selfRating or selfMMR
+    else
+        match.stats.matchRating = 0
+    end
     local function EnsureStat(tbl, guid)
         if guid and tbl[guid] == nil then
             tbl[guid] = 0
@@ -616,7 +550,7 @@ function PvPAnalytics:EndMatch()
                 PvPAnalyticsDB.userProfile.totalLosses = (PvPAnalyticsDB.userProfile.totalLosses or 0) + 1
             end
             
-            -- Calculate performance metrics (inspired by Details! breakdowns)
+            -- Calculate performance metrics (team totals)
             local totalDamage = 0
             local totalHealing = 0
             local totalInterrupts = 0
@@ -626,13 +560,7 @@ function PvPAnalytics:EndMatch()
             
             match.stats.teamDamageShare = totalDamage
             
-            -- Simple Elo-like rating calculation
-            local baseRating = youWon and 1000 or 500
-            local damageBonus = math.min((match.stats.damage[userGuid] or 0) / 10000, 500)
-            local deathPenalty = allyDeaths * 100
-            match.stats.matchRating = math.max(0, baseRating + damageBonus - deathPenalty)
-            
-            -- Update averages
+            -- Update averages for the main user profile using per‑match values
             local totalMatches = PvPAnalyticsDB.userProfile.totalMatches
             local currentAvgDamage = PvPAnalyticsDB.userProfile.avgDamage or 0
             local currentAvgHealing = PvPAnalyticsDB.userProfile.avgHealing or 0
@@ -676,8 +604,13 @@ function PvPAnalytics:EndMatch()
             if playerData.isAlly then
                 local dbPlayer = PvPAnalyticsDB.players[guid]
                 if dbPlayer then
-                    dbPlayer.totalDamage = (dbPlayer.totalDamage or 0) + (match.stats.damage[guid] or 0)
-                    dbPlayer.totalHealing = (dbPlayer.totalHealing or 0) + (match.stats.healing[guid] or 0)
+                    local matchDamage = match.stats.damage[guid] or 0
+                    local matchHealing = match.stats.healing[guid] or 0
+                    local matchInterrupts = match.stats.interrupts[guid] or 0
+
+                    dbPlayer.totalDamage = (dbPlayer.totalDamage or 0) + matchDamage
+                    dbPlayer.totalHealing = (dbPlayer.totalHealing or 0) + matchHealing
+                    dbPlayer.totalInterrupts = (dbPlayer.totalInterrupts or 0) + matchInterrupts
                     dbPlayer.matchesPlayed = (dbPlayer.matchesPlayed or 0) + 1
                     if youWon then 
                         dbPlayer.wins = (dbPlayer.wins or 0) + 1 
@@ -688,7 +621,17 @@ function PvPAnalytics:EndMatch()
                     if totalMatches > 0 then
                         dbPlayer.kdratio = dbPlayer.wins / totalMatches
                     end
-                    dbPlayer.interruptsPerMatch = (dbPlayer.totalDamage or 0) / math.max(dbPlayer.matchesPlayed, 1)  -- Simplified metric
+
+                    -- Per‑player averages for external tools (damage/healing/interrupts)
+                    if dbPlayer.matchesPlayed and dbPlayer.matchesPlayed > 0 then
+                        dbPlayer.avgDamage = (dbPlayer.totalDamage or 0) / dbPlayer.matchesPlayed
+                        dbPlayer.avgHealing = (dbPlayer.totalHealing or 0) / dbPlayer.matchesPlayed
+                        dbPlayer.interruptsPerMatch = (dbPlayer.totalInterrupts or 0) / dbPlayer.matchesPlayed
+                    else
+                        dbPlayer.avgDamage = 0
+                        dbPlayer.avgHealing = 0
+                        dbPlayer.interruptsPerMatch = 0
+                    end
                 end
             end
         end

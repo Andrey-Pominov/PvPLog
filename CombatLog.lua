@@ -12,8 +12,15 @@ local function InitPlayer(guid, name)
     if not addon or not addon.CurrentMatch or not addon.CurrentMatch.stats then
         return
     end
-    
-    if guid and name then
+
+    if not guid or not name then
+        return
+    end
+
+    -- Treat combat pets as non-player actors for team-size/mod calculations
+    if type(guid) == "string" and guid:sub(1, 4) == "Pet-" then
+        -- We still allow stats to be recorded under the GUID, but we avoid
+        -- adding them into the players/opponents tables used for team logic.
         if not addon.CurrentMatch.stats.damage[guid] then
             addon.CurrentMatch.stats.damage[guid] = 0
             addon.CurrentMatch.stats.healing[guid] = 0
@@ -22,12 +29,27 @@ local function InitPlayer(guid, name)
             addon.CurrentMatch.stats.ccChains[guid] = 0
             addon.CurrentMatch.stats.trinketUsage[guid] = 0
             addon.CurrentMatch.stats.bigButtonUsage[guid] = 0
-            if not addon.CurrentMatch.players then
-                addon.CurrentMatch.players = {}
-            end
-            addon.CurrentMatch.players[guid] = { name = name }
         end
+        return
     end
+
+    if not addon.CurrentMatch.stats.damage[guid] then
+        addon.CurrentMatch.stats.damage[guid] = 0
+        addon.CurrentMatch.stats.healing[guid] = 0
+        addon.CurrentMatch.stats.absorbs[guid] = 0
+        addon.CurrentMatch.stats.interrupts[guid] = 0
+        addon.CurrentMatch.stats.ccChains[guid] = 0
+        addon.CurrentMatch.stats.trinketUsage[guid] = 0
+        addon.CurrentMatch.stats.bigButtonUsage[guid] = 0
+    end
+
+    if not addon.CurrentMatch.players then
+        addon.CurrentMatch.players = {}
+    end
+
+    -- Do not overwrite richer player info populated in StartMatch; just ensure name exists.
+    addon.CurrentMatch.players[guid] = addon.CurrentMatch.players[guid] or {}
+    addon.CurrentMatch.players[guid].name = addon.CurrentMatch.players[guid].name or name
 end
 
 -- Helper to check if target has active CC debuff
